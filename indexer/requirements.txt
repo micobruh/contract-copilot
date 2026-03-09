@@ -1,0 +1,4 @@
+sentence_transformers==2.3.0
+chromadb==0.3.0
+datasets==3.2.0
+transformers==4.31.0
