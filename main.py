@@ -20,3 +20,4 @@ results = collection.query(
     query_embeddings=[query_vec],
     n_results=3
 )
+print(f"Title: {results['metadatas'][0]['title']} - Text: {results['documents'][0]}")

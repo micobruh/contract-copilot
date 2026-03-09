@@ -121,6 +121,7 @@ def store_documents_in_batches(collection, chunks, embedding_function, batch_siz
     
     return successful_batches, failed_batches    
 
+
 def build_chroma_database(model_name="jinaai/jina-embeddings-v5-text-small", batch_size=10):
     # Load passages in:
     # isaacus/legal-rag-bench (Judicial College of Victoria’s Criminal Charge Book)
