@@ -20,14 +20,14 @@ class UniversalEmbeddingModel:
         self.model_name = model_name
 
         # Force CPU if current PyTorch build cannot actually use your GPU
-        # if device is None:
-        #     if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7:
-        #         self.device = "cuda"
-        #     else:
-        #         self.device = "cpu"
-        # else:
-        #     self.device = device
-        self.device = "cpu"
+        if device is None:
+            if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7:
+                self.device = "cuda"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
+        # self.device = "cpu"
 
         self.dtype = dtype or (
             torch.bfloat16 if self.device == "cuda" else torch.float32
@@ -133,7 +133,7 @@ def store_documents_in_batches(collection, chunks, embedding_function, batch_siz
                 {
                     "source": source,
                     "title": title,
-                    "footnotes": footnotes,
+                    "footnotes": footnotes if footnotes else "None",
                 }
                 for title, footnotes in zip(batch_chunks["title"], batch_chunks["footnotes"])
             ]
