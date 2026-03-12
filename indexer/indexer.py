@@ -1,5 +1,6 @@
 import tqdm
 from pathlib import Path
+import gc
 
 import chromadb
 import torch
@@ -114,26 +115,40 @@ class ChromaEmbeddingFunction:
         return embeddings
 
 
-def store_documents_in_batches(collection, chunks, embedding_function, batch_size=100):
+def store_documents_in_batches(
+    collection,
+    chunks,
+    embedding_function,
+    embed_batch_size=2,
+    write_batch_size=20,
+):
     total_chunks = len(chunks)
-    successful_batches = 0
-    failed_batches = []
+    successful_writes = 0
+    failed_writes = []
 
-    print(f"Starting to process {total_chunks} chunks, batch size: {batch_size}")
+    print(f"Starting to process {total_chunks} chunks")
+    print(f"Embedding batch size: {embed_batch_size}")
+    print(f"Write batch size: {write_batch_size}")
     print(f"Using custom embedding model: {embedding_function.model.model_name}")
 
-    for i in tqdm.tqdm(range(0, total_chunks, batch_size), desc="Batches Processed"):
-        batch_end = min(i + batch_size, total_chunks)
+    buffer_documents = []
+    buffer_metadatas = []
+    buffer_ids = []
+    buffer_embeddings = []
+
+    source = "Judicial College of Victoria's Criminal Charge Book"
+
+    for i in tqdm(range(0, total_chunks, embed_batch_size), desc="Embedding batches"):
+        batch_end = min(i + embed_batch_size, total_chunks)
         batch_chunks = chunks[i: batch_end]
 
         try:
-            source = "Judicial College of Victoria's Criminal Charge Book"
             documents = batch_chunks["text"]
             metadatas = [
                 {
                     "source": source,
                     "title": title,
-                    "footnotes": footnotes if footnotes else "None",
+                    "footnotes": footnotes if footnotes else "",
                 }
                 for title, footnotes in zip(batch_chunks["title"], batch_chunks["footnotes"])
             ]
@@ -141,36 +156,55 @@ def store_documents_in_batches(collection, chunks, embedding_function, batch_siz
 
             embeddings = embedding_function(documents)
 
-            collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids,
-                embeddings=embeddings,
-            )
+            buffer_documents.extend(documents)
+            buffer_metadatas.extend(metadatas)
+            buffer_ids.extend(ids)
+            buffer_embeddings.extend(embeddings)
 
-            successful_batches += 1
+            # Write only when buffer is large enough
+            if len(buffer_documents) >= write_batch_size:
+                collection.add(
+                    documents=buffer_documents,
+                    metadatas=buffer_metadatas,
+                    ids=buffer_ids,
+                    embeddings=buffer_embeddings,
+                )
+                successful_writes += 1
+
+                buffer_documents.clear()
+                buffer_metadatas.clear()
+                buffer_ids.clear()
+                buffer_embeddings.clear()
+
+                gc.collect()
 
         except Exception as e:
-            print(f"Batch {i // batch_size + 1} failed: {str(e)}")
-            failed_batches.append((i, batch_end, str(e)))
+            print(f"Embedding batch {i // embed_batch_size + 1} failed: {e}")
+            failed_writes.append((i, batch_end, str(e)))
             continue
 
-    print("\nProcessing complete:")
-    print(f"Successful batches: {successful_batches}")
-    print(f"Failed batches: {len(failed_batches)}")
+    # Flush remaining buffered items
+    if buffer_documents:
+        try:
+            collection.add(
+                documents=buffer_documents,
+                metadatas=buffer_metadatas,
+                ids=buffer_ids,
+                embeddings=buffer_embeddings,
+            )
+            successful_writes += 1
+        except Exception as e:
+            print(f"Final buffered write failed: {e}")
+            failed_writes.append(("final", len(buffer_documents), str(e)))
 
-    if failed_batches:
-        print("Failed batch details:")
-        for start, end, error in failed_batches:
-            print(f"  Range {start}-{end}: {error}")
+    print(f"\nProcessing complete:")
+    print(f"Successful writes: {successful_writes}")
+    print(f"Failed writes: {len(failed_writes)}")
 
-    return successful_batches, failed_batches
+    return successful_writes, failed_writes
 
 
-def build_chroma_database(
-    model_name="jinaai/jina-embeddings-v5-text-small",
-    batch_size=10,
-):
+def build_chroma_database(model_name="jinaai/jina-embeddings-v5-text-small"):
     legal_corpus_chunks = load_corpus()
     print("Loaded legal corpus chunks, total chunks:", len(legal_corpus_chunks))
 
@@ -191,7 +225,6 @@ def build_chroma_database(
         collection=collection,
         chunks=legal_corpus_chunks,
         embedding_function=embedding_fn,
-        batch_size=batch_size,
     )
 
     return successful, failed

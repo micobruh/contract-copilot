@@ -5,7 +5,7 @@ import chromadb
 # model_name = "jinaai/jina-embeddings-v5-text-small"
 model_name = "BAAI/bge-m3"
 # Build Chroma database with the specified embedding model and batch size.
-successful, failed = build_chroma_database(model_name=model_name, batch_size=10)
+successful, failed = build_chroma_database(model_name=model_name)
 
 # Load dataset
 client = chromadb.PersistentClient(path="./chroma_db")
