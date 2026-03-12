@@ -1,7 +1,7 @@
 from indexer.indexer import build_chroma_database, UniversalEmbeddingModel, ChromaEmbeddingFunction
 import chromadb
 
-model_name = "Qwen/Qwen3-Embedding-4B"
+model_name = "BAAI/bge-m3"
 # Build Chroma database with the specified embedding model and batch size.
 successful, failed = build_chroma_database(model_name=model_name, batch_size=10)
 
