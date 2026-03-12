@@ -20,13 +20,14 @@ class UniversalEmbeddingModel:
         self.model_name = model_name
 
         # Force CPU if current PyTorch build cannot actually use your GPU
-        if device is None:
-            if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7:
-                self.device = "cuda"
-            else:
-                self.device = "cpu"
-        else:
-            self.device = device
+        # if device is None:
+        #     if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7:
+        #         self.device = "cuda"
+        #     else:
+        #         self.device = "cpu"
+        # else:
+        #     self.device = device
+        self.device = "cpu"
 
         self.dtype = dtype or (
             torch.bfloat16 if self.device == "cuda" else torch.float32
@@ -41,8 +42,8 @@ class UniversalEmbeddingModel:
         if model_name not in self.local_model_map:
             raise ValueError(f"Unsupported model: {model_name}")
 
-        self.models_root = Path(models_root)
-        self.model_path = self.models_root / self.local_model_map[model_name]
+        self.models_root = models_root
+        self.model_path = Path(f"./{self.models_root}/{self.local_model_map[model_name]}")
 
         if not self.model_path.exists():
             raise FileNotFoundError(
@@ -123,20 +124,20 @@ def store_documents_in_batches(collection, chunks, embedding_function, batch_siz
 
     for i in tqdm.tqdm(range(0, total_chunks, batch_size), desc="Batches Processed"):
         batch_end = min(i + batch_size, total_chunks)
-        batch_chunks = chunks[i:batch_end]
+        batch_chunks = chunks[i: batch_end]
 
         try:
             source = "Judicial College of Victoria's Criminal Charge Book"
-            documents = [chunk["text"] for chunk in batch_chunks]
+            documents = batch_chunks["text"]
             metadatas = [
                 {
                     "source": source,
-                    "title": chunk["title"],
-                    "footnotes": chunk["footnotes"],
+                    "title": title,
+                    "footnotes": footnotes,
                 }
-                for chunk in batch_chunks
+                for title, footnotes in zip(batch_chunks["title"], batch_chunks["footnotes"])
             ]
-            ids = [chunk["id"] for chunk in batch_chunks]
+            ids = batch_chunks["id"]
 
             embeddings = embedding_function(documents)
 
