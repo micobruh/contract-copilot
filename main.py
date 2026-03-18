@@ -16,10 +16,10 @@ collection = client.get_collection(
     embedding_function=embedding_fn
 )
 
-query = '“There was an agreement between the accused and the deceased to seek the _____ of all parties to the agreement.” What is the missing word, and where is this specific phrase used?'
-query_vec = embedding_model.encode(query)
-results = collection.query(
-    query_embeddings=[query_vec],
-    n_results=3
-)
-print(f"Title: {results['metadatas'][0]['title']} - Text: {results['documents'][0]}")
+# query = '“There was an agreement between the accused and the deceased to seek the _____ of all parties to the agreement.” What is the missing word, and where is this specific phrase used?'
+# query_vec = embedding_model.encode(query)
+# results = collection.query(
+#     query_embeddings=[query_vec],
+#     n_results=3
+# )
+# print(f"Title: {results['metadatas'][0]['title']} - Text: {results['documents'][0]}")
