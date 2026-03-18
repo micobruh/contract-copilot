@@ -157,7 +157,7 @@ def store_documents_in_batches(chunks, embedding_wrapper, batch_size=2):
         persist_directory="./chroma_db"
     )
 
-    for min_document_index in range(0, len(documents), batch_size):
+    for min_document_index in tqdm(range(0, len(documents), batch_size), desc="Processing document batches"):
         try:
             max_document_index = min(min_document_index + batch_size, total_chunks)
             client.add_documents(documents[min_document_index: max_document_index])
