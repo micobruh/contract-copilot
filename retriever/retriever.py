@@ -28,6 +28,13 @@ def bm25_retrieval(query, k_bm25=10):
     return bm25_docs
 
 
+def add_rrf_scores(docs, scores, doc_map, k_final=60):
+    for rank, doc in enumerate(docs, start=1):
+        doc_id = doc.metadata.get("doc_id") or doc.metadata.get("id") or doc.page_content
+        scores[doc_id] += 1.0 / (k_final + rank)
+        doc_map[doc_id] = doc    
+
+
 def rrf_fuse(vector_docs, bm25_docs, k_final=60):
     """
     Reciprocal Rank Fusion.
@@ -36,15 +43,9 @@ def rrf_fuse(vector_docs, bm25_docs, k_final=60):
     scores = defaultdict(float)
     doc_map = {}
 
-    for rank, doc in enumerate(vector_docs, start=1):
-        doc_id = doc.metadata.get("doc_id") or doc.metadata.get("id") or doc.page_content
-        scores[doc_id] += 1.0 / (k_final + rank)
-        doc_map[doc_id] = doc
-
-    for rank, doc in enumerate(bm25_docs, start=1):
-        doc_id = doc.metadata.get("doc_id") or doc.metadata.get("id") or doc.page_content
-        scores[doc_id] += 1.0 / (k_final + rank)
-        doc_map[doc_id] = doc
+    # Add scores from both retrievals
+    add_rrf_scores(vector_docs, scores, doc_map, k_final)
+    add_rrf_scores(bm25_docs, scores, doc_map, k_final)
 
     fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [doc_map[doc_id] for doc_id, _ in fused]
