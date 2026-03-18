@@ -1,13 +1,12 @@
 from tqdm import tqdm
 from pathlib import Path
-
+import pickle
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModel
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
-
 from .ocr_loader import load_corpus
 
 
@@ -131,7 +130,7 @@ class LocalEmbeddingWrapper(Embeddings):
 def store_documents_in_batches(chunks, embedding_wrapper, batch_size=2):
     total_chunks = len(chunks)
     successful_writes = 0
-    failed_writes = []
+    failed_writes = 0
 
     print(f"Starting to process {total_chunks} chunks")
     print(f"Batch size: {batch_size}")
@@ -149,9 +148,11 @@ def store_documents_in_batches(chunks, embedding_wrapper, batch_size=2):
             id=chunk["id"]
         )
         for chunk in chunks
-    ]    
+    ]
+    with open("documents/docs.pkl", "wb") as f:
+        pickle.dump(documents, f)        
 
-    client = Chroma(
+    vectorstore = Chroma(
         collection_name="Law_RAG",
         embedding_function=embedding_wrapper,
         persist_directory="./chroma_db"
@@ -160,7 +161,7 @@ def store_documents_in_batches(chunks, embedding_wrapper, batch_size=2):
     for min_document_index in tqdm(range(0, len(documents), batch_size), desc="Processing document batches"):
         try:
             max_document_index = min(min_document_index + batch_size, total_chunks)
-            client.add_documents(documents[min_document_index: max_document_index])
+            vectorstore.add_documents(documents[min_document_index: max_document_index])
             successful_writes += max_document_index - min_document_index
         except Exception as e:
             failed_writes += max_document_index - min_document_index
