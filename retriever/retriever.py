@@ -2,19 +2,21 @@ from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 import pickle
 from collections import defaultdict
-from indexer.indexer import UniversalEmbeddingModel, LocalEmbeddingWrapper
+from model.embeddings import create_embedding_wrapper
+from model.reranker import rerank
 
 
-def vector_similarity_search(query, model_name="BAAI/bge-m3", k_vector=10):
+def vector_similarity_search(query, embedding_model_name="BAAI/bge-m3", k_vector=10):
     # Retrieve from vector store
-    embedding_model = UniversalEmbeddingModel(model_name)
-    embedding_wrapper = LocalEmbeddingWrapper(embedding_model)
+    embedding_wrapper = create_embedding_wrapper(embedding_model_name)
+    new_query = query if embedding_model_name == "jinaai/jina-embeddings-v5-text-small" else "query: " + query
+
     vectorstore = Chroma(
         collection_name="Law_RAG",
         persist_directory="./chroma_db",
         embedding_function=embedding_wrapper,
     )
-    vector_docs = vectorstore.similarity_search(query, k=k_vector)
+    vector_docs = vectorstore.similarity_search(new_query, k=k_vector)
     return vector_docs
 
 
@@ -28,14 +30,14 @@ def bm25_retrieval(query, k_bm25=10):
     return bm25_docs
 
 
-def add_rrf_scores(docs, scores, doc_map, k_final=60):
+def add_rrf_scores(docs, scores, doc_map, k_rrf):
     for rank, doc in enumerate(docs, start=1):
         doc_id = doc.metadata.get("doc_id") or doc.metadata.get("id") or doc.page_content
-        scores[doc_id] += 1.0 / (k_final + rank)
+        scores[doc_id] += 1.0 / (k_rrf + rank)
         doc_map[doc_id] = doc    
 
 
-def rrf_fuse(vector_docs, bm25_docs, k_final=60):
+def rrf_fuse(vector_docs, bm25_docs, k_rrf=10):
     """
     Reciprocal Rank Fusion.
     Higher score = better.
@@ -44,16 +46,16 @@ def rrf_fuse(vector_docs, bm25_docs, k_final=60):
     doc_map = {}
 
     # Add scores from both retrievals
-    add_rrf_scores(vector_docs, scores, doc_map, k_final)
-    add_rrf_scores(bm25_docs, scores, doc_map, k_final)
+    add_rrf_scores(vector_docs, scores, doc_map, k_rrf)
+    add_rrf_scores(bm25_docs, scores, doc_map, k_rrf)
 
     fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [doc_map[doc_id] for doc_id, _ in fused]
+    return [doc_map[doc_id] for doc_id, _ in fused][: k_rrf]
 
 
-def retrieve(query, model_name="BAAI/bge-m3", k_vector=10, k_bm25=10, k_final=5):
-    vector_docs = vector_similarity_search(query, model_name=model_name, k_vector=k_vector)
+def retrieve(query, embedding_model_name="BAAI/bge-m3", reranker_model_name="BAAI/bge-reranker-base", k_vector=10, k_bm25=10, k_rrf=10, k_rerank=3):
+    vector_docs = vector_similarity_search(query, embedding_model_name=embedding_model_name, k_vector=k_vector)
     bm25_docs = bm25_retrieval(query, k_bm25=k_bm25)
-    fused_docs = rrf_fuse(vector_docs, bm25_docs, k_final=k_final)
-    print(f"Total docs found: {len(vector_docs)} from vector search, {len(bm25_docs)} from BM25, fused to {len(fused_docs)}")
-    return fused_docs[: k_final]
+    fused_docs = rrf_fuse(vector_docs, bm25_docs, k_rrf=k_rrf)
+    reranked_docs = rerank(query, fused_docs, reranker_model_name=reranker_model_name, k_rerank=k_rerank)
+    return reranked_docs

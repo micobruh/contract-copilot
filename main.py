@@ -3,12 +3,13 @@ from retriever.retriever import retrieve
 
 # model_name = "Qwen/Qwen3-Embedding-4B"
 # model_name = "jinaai/jina-embeddings-v5-text-small"
-model_name = "BAAI/bge-m3"
+embedding_model_name = "BAAI/bge-m3"
+reranker_model_name = "BAAI/bge-reranker-base"
 # Build Chroma database with the specified embedding model and batch size.
-# successful, failed = build_chroma_database(model_name=model_name)
+# successful, failed = build_chroma_database(embedding_model_name=embedding_model_name)
 
 query = '“There was an agreement between the accused and the deceased to seek the _____ of all parties to the agreement.” What is the missing word, and where is this specific phrase used?'
-docs = retrieve(query, model_name=model_name)
+docs = retrieve(query, embedding_model_name=embedding_model_name, reranker_model_name=reranker_model_name)
 for doc in docs:
     print(f"Title: {doc.metadata['title']}\n")
     print(f"Text: {doc.page_content}\n")
