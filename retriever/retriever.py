@@ -88,29 +88,24 @@ def answer_question(query):
 
         Given this question: {query}
 
-        Answer using ONLY using the provided document sources: {context} 
+        Answer using ONLY the provided document sources: {context} 
 
         Extract the most relevant passage from the retrieved documents that answers the question.
 
         If the answer isn't there, say "I don't know." Do not use prior knowledge.
         """
-    )   
-
-    llm = OllamaLLM(
-        model="llama3"
     )
-    answer = llm.invoke(prompt)
-
+    llm = OllamaLLM(model="llama3")
     retriever = RunnableLambda(retrieve)
     rag_chain = (
         {
             "context": retriever | format_context,
-            "question": query,
+            "query": RunnablePassthrough(),
         }
         | prompt
         | llm
         | StrOutputParser()
     )
-
-    answer = rag_chain.invoke("What are the elements of theft?")
+    
+    answer = rag_chain.invoke(query)
     print(answer)
