@@ -1,5 +1,5 @@
-from indexer.indexer import build_chroma_database, UniversalEmbeddingModel, LocalEmbeddingWrapper
-from retriever.retriever import retrieve
+from indexer.indexer import build_chroma_database
+from retriever.retriever import answer_question
 
 # model_name = "Qwen/Qwen3-Embedding-4B"
 # model_name = "jinaai/jina-embeddings-v5-text-small"
@@ -9,8 +9,4 @@ reranker_model_name = "BAAI/bge-reranker-base"
 # successful, failed = build_chroma_database(embedding_model_name=embedding_model_name)
 
 query = '“There was an agreement between the accused and the deceased to seek the _____ of all parties to the agreement.” What is the missing word, and where is this specific phrase used?'
-docs = retrieve(query, embedding_model_name=embedding_model_name, reranker_model_name=reranker_model_name)
-for doc in docs:
-    print(f"Title: {doc.metadata['title']}\n")
-    print(f"Text: {doc.page_content}\n")
-    print("\n---\n")
+answer_question(query)

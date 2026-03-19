@@ -1,5 +1,9 @@
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_ollama import OllamaLLM
 import pickle
 from collections import defaultdict
 from model.embeddings import create_embedding_wrapper
@@ -53,9 +57,60 @@ def rrf_fuse(vector_docs, bm25_docs, k_rrf=10):
     return [doc_map[doc_id] for doc_id, _ in fused][: k_rrf]
 
 
-def retrieve(query, embedding_model_name="BAAI/bge-m3", reranker_model_name="BAAI/bge-reranker-base", k_vector=10, k_bm25=10, k_rrf=10, k_rerank=3):
+def retrieve(query, embedding_model_name="BAAI/bge-m3", reranker_model_name="BAAI/bge-reranker-base", k_vector=10, k_bm25=10, k_rrf=10, k_rerank=3, rerank_needed=True):
     vector_docs = vector_similarity_search(query, embedding_model_name=embedding_model_name, k_vector=k_vector)
     bm25_docs = bm25_retrieval(query, k_bm25=k_bm25)
     fused_docs = rrf_fuse(vector_docs, bm25_docs, k_rrf=k_rrf)
-    reranked_docs = rerank(query, fused_docs, reranker_model_name=reranker_model_name, k_rerank=k_rerank)
-    return reranked_docs
+    if rerank_needed:
+        final_docs = rerank(query, fused_docs, reranker_model_name=reranker_model_name, k_rerank=k_rerank)
+    else:
+        final_docs = fused_docs[: k_rerank]
+    return final_docs
+
+
+def format_context(docs):
+    parts = []
+    for i, doc in enumerate(docs, 1):
+        title = doc.metadata.get("title", "Unknown")
+        source = doc.metadata.get("source", "")
+        parts.append(
+            f"[{i}] Title: {title}\n"
+            f"Source: {source}\n"
+            f"Text: {doc.page_content.strip()}"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+def answer_question(query):
+    prompt = ChatPromptTemplate.from_template(
+        """
+        You are a helpful Law AI assistant.
+
+        Given this question: {query}
+
+        Answer using ONLY using the provided document sources: {context} 
+
+        Extract the most relevant passage from the retrieved documents that answers the question.
+
+        If the answer isn't there, say "I don't know." Do not use prior knowledge.
+        """
+    )   
+
+    llm = OllamaLLM(
+        model="llama3"
+    )
+    answer = llm.invoke(prompt)
+
+    retriever = RunnableLambda(retrieve)
+    rag_chain = (
+        {
+            "context": retriever | format_context,
+            "question": query,
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    answer = rag_chain.invoke("What are the elements of theft?")
+    print(answer)
