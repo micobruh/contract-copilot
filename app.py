@@ -1,6 +1,6 @@
 import streamlit as st
 # from indexer.indexer import process_file
-from retriever.retriever import answer_question
+from retriever import answer_question
 
 # Page configuration
 st.set_page_config(page_title="RAG Demo", layout="wide")
