@@ -31,6 +31,13 @@ if page == "Question Answering":
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+            if message["role"] == "assistant" and "sources" in message:
+                with st.expander("Reference Sources", expanded=False):
+                    for i, doc in enumerate(message["sources"], start=1):
+                        st.markdown(f"**[{i}] {doc.metadata.get('title', 'Unknown Title')}, ID: {doc.id}**")
+                        st.caption(doc.metadata.get('source', 'Unknown Source'))
+                        st.write(doc.page_content)
+
     query = st.chat_input("Enter your question")
 
     if query:
@@ -62,10 +69,17 @@ if page == "Question Answering":
                         full_response += chunk
                         placeholder.markdown(full_response + "▌")  # Show the answer with a cursor
                     placeholder.markdown(full_response)  # Final answer without cursor
-                    st.session_state.messages.append({"role": "assistant", "content": full_response})  # Save the assistant's response in session state
                     # answer = rag_chain.invoke({"query": query, "context": context})
                     # generation_time = time.time() - start_generation
                     # st.write(answer)
+
+                with st.expander("Reference Sources", expanded=False):
+                    for i, doc in enumerate(docs, start=1):
+                        st.markdown(f"**[{i}] {doc.metadata.get('title', 'Unknown Title')}, ID: {doc.id}**")
+                        st.caption(doc.metadata.get('source', 'Unknown Source'))
+                        st.write(doc.page_content)
+
+                st.session_state.messages.append({"role": "assistant", "content": full_response, "sources": docs})  # Save the assistant's response in session state
 
                 # st.markdown("### Performance")
                 # st.write(f"Retrieval time: {retrieval_time:.2f} seconds")
