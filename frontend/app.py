@@ -15,13 +15,13 @@ if page == "Question Answering":
     if st.button("Submit Query"):
         with st.spinner("Retrieving and generating answer..."):
             # Call the answer_question function from the retriever  
-            answer, refs = answer_question(query)
+            answer = answer_question(query)
         st.subheader("Answer")
         st.write(answer)
         
-        with st.expander("Reference Sources"):
-            for ref in refs:
-                st.markdown(f"- {ref}")
+        # with st.expander("Reference Sources"):
+        #     for ref in refs:
+        #         st.markdown(f"- {ref}")
 
 elif page == "File Upload":
     st.header("File Upload & Indexing")

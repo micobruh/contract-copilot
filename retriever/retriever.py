@@ -95,7 +95,9 @@ def answer_question(query):
         If the answer isn't there, say "I don't know." Do not use prior knowledge.
         """
     )
-    llm = OllamaLLM(model="llama3")
+    # LLM options: qwen, phi3, llama3, deepseek-r1:1.5b
+    # Current best LLM: phi3
+    llm = OllamaLLM(model="phi3")
     retriever = RunnableLambda(retrieve)
     rag_chain = (
         {
