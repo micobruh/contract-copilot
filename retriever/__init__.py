@@ -5,6 +5,7 @@ from .retriever import (
     rrf_fuse,
     retrieve,
     format_context,
+    build_rag_chain,
     answer_question,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "rrf_fuse",
     "retrieve",
     "format_context",
+    "build_rag_chain",
     "answer_question",
 ]

@@ -100,7 +100,7 @@ def format_context(docs):
 
 @st.cache_resource
 def load_llm(llm_model_name):
-    return OllamaLLM(model=llm_model_name, streaming=True, num_predict=200)
+    return OllamaLLM(model=llm_model_name, streaming=True)
 
 
 @st.cache_resource
