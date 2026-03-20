@@ -100,7 +100,7 @@ def format_context(docs):
 
 @st.cache_resource
 def load_llm(llm_model_name):
-    return OllamaLLM(model=llm_model_name)
+    return OllamaLLM(model=llm_model_name, streaming=True, num_predict=200)
 
 
 @st.cache_resource
@@ -118,20 +118,43 @@ def build_rag_chain(llm_model_name):
         If the answer isn't there, say "I don't know." Do not use prior knowledge.
         """
     )
-    retriever = RunnableLambda(retrieve)
     llm = load_llm(llm_model_name)
-    rag_chain = (
-        {
-            "context": retriever | format_context,
-            "query": RunnablePassthrough(),
-        }
-        | prompt
+    return (
+        prompt
         | llm
         | StrOutputParser()
     )
-    return rag_chain
 
 
-def answer_question(query, model_name):
-    rag_chain = build_rag_chain(model_name)
+# @st.cache_resource
+# def build_rag_chain(llm_model_name):
+#     prompt = ChatPromptTemplate.from_template(
+#         """
+#         You are a helpful Law AI assistant.
+
+#         Given this question: {query}
+
+#         Answer using ONLY the provided document sources: {context} 
+
+#         Extract the most relevant passage from the retrieved documents that answers the question.
+
+#         If the answer isn't there, say "I don't know." Do not use prior knowledge.
+#         """
+#     )
+#     retriever = RunnableLambda(retrieve)
+#     llm = load_llm(llm_model_name)
+#     rag_chain = (
+#         {
+#             "context": retriever | format_context,
+#             "query": RunnablePassthrough(),
+#         }
+#         | prompt
+#         | llm
+#         | StrOutputParser()
+#     )
+#     return rag_chain
+
+
+def answer_question(query, llm_model_name):
+    rag_chain = build_rag_chain(llm_model_name)
     return rag_chain.invoke(query)
