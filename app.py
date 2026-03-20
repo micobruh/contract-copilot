@@ -1,5 +1,5 @@
 import streamlit as st
-import time
+# import time
 # from indexer.indexer import process_file
 from retriever import retrieve, format_context, build_rag_chain
 
@@ -62,7 +62,7 @@ if page == "Question Answering":
                         full_response += chunk
                         placeholder.markdown(full_response + "▌")  # Show the answer with a cursor
                     placeholder.markdown(full_response)  # Final answer without cursor
-                    st.session_state.message.append({"role": "assistant", "content": full_response})  # Save the assistant's response in session state
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})  # Save the assistant's response in session state
                     # answer = rag_chain.invoke({"query": query, "context": context})
                     # generation_time = time.time() - start_generation
                     # st.write(answer)
