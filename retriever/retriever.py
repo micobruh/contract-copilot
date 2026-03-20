@@ -6,30 +6,47 @@ from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_ollama import OllamaLLM
 import pickle
 from collections import defaultdict
+import streamlit as st
 from model.embeddings import create_embedding_wrapper
 from model.reranker import rerank
 
 
-def vector_similarity_search(query, embedding_model_name="BAAI/bge-m3", k_vector=10):
-    # Retrieve from vector store
+@st.cache_resource
+def load_vectorstore(embedding_model_name):
     embedding_wrapper = create_embedding_wrapper(embedding_model_name)
-    new_query = query if embedding_model_name == "jinaai/jina-embeddings-v5-text-small" else "query: " + query
-
-    vectorstore = Chroma(
+    return Chroma(
         collection_name="Law_RAG",
         persist_directory="./chroma_db",
         embedding_function=embedding_wrapper,
     )
+
+
+def vector_similarity_search(query, embedding_model_name="BAAI/bge-m3", k_vector=10):
+    # Retrieve from vector store
+    new_query = query if embedding_model_name == "jinaai/jina-embeddings-v5-text-small" else "query: " + query
+    vectorstore = load_vectorstore(embedding_model_name)
     vector_docs = vectorstore.similarity_search(new_query, k=k_vector)
     return vector_docs
 
 
-def bm25_retrieval(query, k_bm25=10):
+@st.cache_data
+def load_bm25_docs():
     # Retrieve from BM25
     with open("documents/docs.pkl", "rb") as f:
-        docs = pickle.load(f)
+        return pickle.load(f)
+    
+
+@st.cache_resource
+def load_bm25_retriever(k_bm25):
+    docs = load_bm25_docs()
     bm25_retriever = BM25Retriever.from_documents(docs)
     bm25_retriever.k = k_bm25
+    return bm25_retriever    
+
+
+def bm25_retrieval(query, k_bm25=10):
+    # Retrieve from BM25
+    bm25_retriever = load_bm25_retriever(k_bm25)
     bm25_docs = bm25_retriever.invoke(query)
     return bm25_docs
 
@@ -81,7 +98,13 @@ def format_context(docs):
     return "\n\n---\n\n".join(parts)
 
 
-def answer_question(query):
+@st.cache_resource
+def load_llm(llm_model_name):
+    return OllamaLLM(model=llm_model_name)
+
+
+@st.cache_resource
+def build_rag_chain(llm_model_name):
     prompt = ChatPromptTemplate.from_template(
         """
         You are a helpful Law AI assistant.
@@ -95,10 +118,8 @@ def answer_question(query):
         If the answer isn't there, say "I don't know." Do not use prior knowledge.
         """
     )
-    # LLM options: qwen, phi3, llama3, deepseek-r1:1.5b
-    # Current best LLM: phi3
-    llm = OllamaLLM(model="phi3")
     retriever = RunnableLambda(retrieve)
+    llm = load_llm(llm_model_name)
     rag_chain = (
         {
             "context": retriever | format_context,
@@ -108,6 +129,9 @@ def answer_question(query):
         | llm
         | StrOutputParser()
     )
-    
-    answer = rag_chain.invoke(query)
-    print(answer)
+    return rag_chain
+
+
+def answer_question(query, model_name):
+    rag_chain = build_rag_chain(model_name)
+    return rag_chain.invoke(query)

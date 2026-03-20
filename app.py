@@ -1,6 +1,6 @@
 import streamlit as st
 # from indexer.indexer import process_file
-from retriever import answer_question
+from retriever import build_rag_chain, answer_question
 
 # Page configuration
 st.set_page_config(page_title="RAG Demo", layout="wide")
@@ -14,8 +14,10 @@ if page == "Question Answering":
 
     if st.button("Submit Query"):
         with st.spinner("Retrieving and generating answer..."):
-            # Call the answer_question function from the retriever  
-            answer = answer_question(query)
+            # Call the answer_question function from the retriever
+            # LLM options: qwen, phi3, llama3, deepseek-r1:1.5b
+            # Current best LLM: phi3            
+            answer = answer_question(query, "phi3")
         st.subheader("Answer")
         st.write(answer)
         

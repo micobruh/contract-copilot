@@ -2,6 +2,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModel
 from langchain_core.embeddings import Embeddings
+import streamlit as st
 from utils.utils import determine_device, determine_dtype, determine_model_path
 
 
@@ -88,6 +89,7 @@ class LocalEmbeddingWrapper(Embeddings):
         return embedding.tolist()
     
 
+@st.cache_resource
 def create_embedding_wrapper(embedding_model_name="BAAI/bge-m3"):
     embedding_model = UniversalEmbeddingModel(embedding_model_name)
     embedding_wrapper = LocalEmbeddingWrapper(embedding_model)

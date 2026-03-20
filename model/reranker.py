@@ -1,7 +1,9 @@
 from sentence_transformers import CrossEncoder
+import streamlit as st
 from utils.utils import determine_device, determine_dtype, determine_model_path
 
 
+@st.cache_resource
 def load_reranker(reranker_model_name="BAAI/bge-reranker-base", reranker_models_root="reranker_models"):
     device = determine_device()
     dtype = determine_dtype(device)
