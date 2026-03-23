@@ -1,3 +1,5 @@
+import os
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 # from langchain_core.runnables import RunnablePassthrough, RunnableLambda
@@ -8,7 +10,11 @@ from ..config import config
 
 @st.cache_resource
 def load_llm(llm_model_name=config.default_llm_model_name):
-    return OllamaLLM(model=llm_model_name, streaming=True)
+    return OllamaLLM(
+        model=llm_model_name,
+        streaming=True,
+        base_url=os.getenv("OLLAMA_HOST"),
+    )
 
 
 @st.cache_resource
