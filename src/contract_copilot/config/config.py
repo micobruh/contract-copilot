@@ -8,6 +8,8 @@ import yaml
 @dataclass(frozen=True)
 class AppConfig:
     storing_batch_size: int
+    embedding_batch_size: int
+    rerank_batch_size: int
     collection_name: str
     bm25_doc_link: str
     chroma_db_link: str

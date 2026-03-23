@@ -29,7 +29,11 @@ def load_reranker(
 def rerank(query, docs, reranker_model_name=config.default_reranker_model_name, k_rerank=config.k_rerank):
     reranker = load_reranker(reranker_model_name)
     pairs = [(query, doc.page_content) for doc in docs]
-    scores = reranker.predict(pairs)
+    scores = reranker.predict(
+        pairs,
+        batch_size=config.rerank_batch_size,
+        show_progress_bar=False,
+    )
 
     reranked_docs = sorted(
         zip(docs, scores),

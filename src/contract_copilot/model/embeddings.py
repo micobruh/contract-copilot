@@ -59,8 +59,19 @@ class UniversalEmbeddingModel:
 
         if self.backend == "sentence_transformer":
             if self.embedding_model_name == "Qwen/Qwen3-Embedding-4B":
-                return self.model.encode(texts, prompt_name="query")
-            return self.model.encode(texts)
+                return self.model.encode(
+                    texts,
+                    prompt_name="query",
+                    batch_size=config.embedding_batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+            return self.model.encode(
+                texts,
+                batch_size=config.embedding_batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
 
         elif self.backend == "transformers":
             with torch.no_grad():
@@ -80,7 +91,7 @@ class LocalEmbeddingWrapper(Embeddings):
         return embeddings.tolist()
 
     def embed_query(self, text):
-        embedding = self.model.encode([text])[0]
+        embedding = self.model.encode(text)[0]
         return embedding.tolist()
     
 

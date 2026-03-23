@@ -1,5 +1,7 @@
 ---
-storing_batch_size: 2
+storing_batch_size: 64
+embedding_batch_size: 32
+rerank_batch_size: 16
 collection_name: "Law_RAG"
 bm25_doc_link: "./artifacts/bm25_docs.pkl"
 chroma_db_link: "./artifacts/chroma_db"
