@@ -1,18 +1,34 @@
 import torch
 from pathlib import Path
 
+
 def determine_device():
-    # Force CPU if current PyTorch build cannot actually use your GPU
-    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7:
-        device = "cuda"
-    else:
-        device = "cpu"
-    return device    
+    # Prefer CUDA when available, but fall back to CPU if the installed
+    # PyTorch/CUDA stack cannot actually execute kernels on this GPU.
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    try:
+        test_tensor = torch.zeros(1, device="cuda")
+        _ = test_tensor + 1
+        return "cuda"
+    except Exception as exc:
+        print(f"CUDA unavailable at runtime, falling back to CPU: {exc}")
+        return "cpu"
 
 
 def determine_dtype(device):
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32    
-    return dtype        
+    if device != "cuda":
+        return torch.float32
+
+    major, _minor = torch.cuda.get_device_capability(0)
+
+    # bfloat16 support is reliable on newer GPUs only.
+    if major >= 8:
+        return torch.bfloat16
+
+    # Older CUDA GPUs are more likely to work with float16 than bfloat16.
+    return torch.float16
 
 
 def determine_model_path(model_name, local_model_map, models_root):
