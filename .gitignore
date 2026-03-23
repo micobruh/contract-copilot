@@ -1,4 +1,3 @@
 /data
-/chroma_db
-/embedding_models
-/reranker_models
+/artifacts
+/local_models

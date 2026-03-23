@@ -1,7 +1,23 @@
 import streamlit as st
 # import time
 # from indexer.indexer import process_file
-from retriever import retrieve, format_context, build_rag_chain
+
+try:
+    from contract_copilot.config import config
+    from contract_copilot.model import build_rag_chain
+    from contract_copilot.retriever import format_context, retrieve
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    SRC_ROOT = PROJECT_ROOT / "src"
+    if str(SRC_ROOT) not in sys.path:
+        sys.path.insert(0, str(SRC_ROOT))
+
+    from contract_copilot.config import config
+    from contract_copilot.model import build_rag_chain
+    from contract_copilot.retriever import format_context, retrieve
 
 # Page configuration
 st.set_page_config(page_title="Legal RAG Assistant", layout="wide")
@@ -10,7 +26,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "llm_model_name" not in st.session_state:
-    st.session_state.llm_model_name = "phi3"  # Default LLM model     
+    st.session_state.llm_model_name = config.default_llm_model_name
 
 # Sidebar menu
 page = st.sidebar.selectbox("Choose the page", ["Question Answering", "File Upload"])
@@ -19,10 +35,13 @@ if page == "Question Answering":
     st.header("RAG Question Answering")
     # LLM options: phi3, qwen, deepseek-r1:1.5b
     # Current best LLM: phi3        
-    llm_model_name = st.selectbox("Choose LLM model", 
-                                  options=["phi3", "qwen", "deepseek-r1:1.5b"], 
-                                  index=["phi3", "qwen", "deepseek-r1:1.5b"].index(st.session_state.llm_model_name),
-                                  key="llm_model_selector")
+    llm_options = [config.default_llm_model_name, "qwen", "deepseek-r1:1.5b"]
+    llm_model_name = st.selectbox(
+        "Choose LLM model",
+        options=llm_options,
+        index=llm_options.index(st.session_state.llm_model_name),
+        key="llm_model_selector",
+    )
     st.session_state.llm_model_name = llm_model_name  # Update session state with the selected model
     st.caption(f"Current LLM model: {llm_model_name}")
 

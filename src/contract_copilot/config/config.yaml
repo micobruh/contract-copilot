@@ -1,0 +1,21 @@
+---
+storing_batch_size: 2
+collection_name: "Law_RAG"
+bm25_doc_link: "./artifacts/bm25_docs.pkl"
+chroma_db_link: "./artifacts/chroma_db"
+embedding_models_root: "./local_models/embedding_models"
+reranker_models_root: "./local_models/reranker_models"
+default_embedding_model_name: "BAAI/bge-m3"
+default_reranker_model_name: "BAAI/bge-reranker-base"
+default_llm_model_name: "phi3"
+local_embedding_model_map:
+    "BAAI/bge-m3": "bge-m3"
+    "Qwen/Qwen3-Embedding-4B": "Qwen3-Embedding-4B"
+    "jinaai/jina-embeddings-v5-text-small": "jina-embeddings-v5-text-small"
+local_reranker_model_map:
+    "BAAI/bge-reranker-base": "bge-reranker-base"
+k_vector: 10
+k_bm25: 10
+k_rrf: 10
+k_rerank: 3
+rerank_needed: true

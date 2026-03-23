@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contract-copilot"
+version = "0.1.0"
+description = "A legal RAG assistant for retrieval, reranking, and question answering."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sentence_transformers==3.0.1",
+    "langchain_core==0.1.0",
+    "langchain_chroma==0.1.0",
+    "langchain_community==0.1.0",
+    "langchain_ollama==0.1.0",
+    "rank-bm25==0.2.1",
+    "datasets==3.2.0",
+    "transformers==4.41.2",
+    "torch==2.0.1",
+    "torchvision==0.15.2",
+    "torchaudio==2.0.2",
+    "tqdm==4.64.0",
+    "numpy==1.26.4",
+    "streamlit==1.24.0",
+    "pyyaml==6.0.2",
+]
+
+[project.scripts]
+contract-copilot-build-index = "contract_copilot.cli:build_index_main"
+contract-copilot-run = "contract_copilot.cli:run_cli_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
