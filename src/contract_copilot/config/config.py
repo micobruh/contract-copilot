@@ -24,6 +24,7 @@ class AppConfig:
     k_bm25: int
     k_rrf: int
     k_rerank: int
+    hybrid_needed: bool
     rerank_needed: bool
 
 

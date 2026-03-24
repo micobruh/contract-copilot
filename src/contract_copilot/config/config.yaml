@@ -20,4 +20,5 @@ k_vector: 10
 k_bm25: 10
 k_rrf: 10
 k_rerank: 3
+hybrid_needed: true
 rerank_needed: true
