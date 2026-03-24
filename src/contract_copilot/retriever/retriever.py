@@ -13,20 +13,23 @@ def retrieve(
     k_bm25=config.k_bm25,
     k_rrf=config.k_rrf,
     k_rerank=config.k_rerank,
-    hybrid_needed=config.hybrid_needed,
+    search_method=config.search_method,
     rerank_needed=config.rerank_needed,
 ):
-    vector_docs = vector_similarity_search(query, embedding_model_name=embedding_model_name, k_vector=k_vector)
-    if hybrid_needed:
+    if search_method == "vector":
+        docs_before_ranking = vector_similarity_search(query, embedding_model_name=embedding_model_name, k_vector=k_vector)
+    elif search_method == "bm25":
+        docs_before_ranking = bm25_retrieval(query, k_bm25=k_bm25)
+    elif search_method == "hybrid":    
+        vector_docs = vector_similarity_search(query, embedding_model_name=embedding_model_name, k_vector=k_vector)
         bm25_docs = bm25_retrieval(query, k_bm25=k_bm25)
-        fused_docs = rrf_fuse(vector_docs, bm25_docs, k_rrf=k_rrf)
-        if rerank_needed:
-            final_docs = rerank(query, fused_docs, reranker_model_name=reranker_model_name, k_rerank=k_rerank)
-        else:
-            final_docs = fused_docs[: k_rrf]
+        docs_before_ranking = rrf_fuse(vector_docs, bm25_docs, k_rrf=k_rrf)
     else:
-        final_docs = vector_docs[: k_vector]        
-    return final_docs
+        raise ValueError(f"Invalid search method: {search_method}")     
+    
+    if rerank_needed:
+        return rerank(query, docs_before_ranking, reranker_model_name=reranker_model_name, k_rerank=k_rerank)
+    return docs_before_ranking
 
 
 def format_context(docs):
