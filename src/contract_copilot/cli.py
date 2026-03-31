@@ -1,12 +1,12 @@
 import argparse
 
 from .config import config
-from .indexer import build_chroma_database
+from .indexer import build_qdrant_database
 from .model.llm import answer_question
 
 
 def build_index_main() -> int:
-    parser = argparse.ArgumentParser(description="Build the Chroma and BM25 indexes.")
+    parser = argparse.ArgumentParser(description="Build the Qdrant index.")
     parser.add_argument(
         "--embedding-model",
         default=config.default_embedding_model_name,
@@ -14,7 +14,7 @@ def build_index_main() -> int:
     )
     args = parser.parse_args()
 
-    successful, failed = build_chroma_database(embedding_model_name=args.embedding_model)
+    successful, failed = build_qdrant_database(embedding_model_name=args.embedding_model)
     print(f"Indexing complete. Successful writes: {successful}, failed writes: {failed}")
     return 0
 

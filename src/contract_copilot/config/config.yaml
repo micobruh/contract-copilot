@@ -3,8 +3,7 @@ storing_batch_size: 64
 embedding_batch_size: 32
 rerank_batch_size: 16
 collection_name: "Law_RAG"
-bm25_doc_link: "./artifacts/bm25_docs.pkl"
-chroma_db_link: "./artifacts/chroma_db"
+qdrant_db_link: "./artifacts/qdrant_db"
 embedding_models_root: "./local_models/embedding_models"
 reranker_models_root: "./local_models/reranker_models"
 default_embedding_model_name: "BAAI/bge-m3" # Options: BAAI/bge-m3, Qwen/Qwen3-Embedding-4B, jinaai/jina-embeddings-v5-text-small

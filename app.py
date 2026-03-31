@@ -28,6 +28,14 @@ if "messages" not in st.session_state:
 if "llm_model_name" not in st.session_state:
     st.session_state.llm_model_name = config.default_llm_model_name
 
+
+def get_doc_title(doc):
+    return doc.metadata.get("title") or doc.metadata.get("document_title") or "Unknown Title"
+
+
+def get_doc_source(doc):
+    return doc.metadata.get("source") or doc.metadata.get("source_path") or "Unknown Source"
+
 # Sidebar menu
 page = st.sidebar.selectbox("Choose the page", ["Question Answering", "File Upload"])
 
@@ -53,8 +61,8 @@ if page == "Question Answering":
             if message["role"] == "assistant" and "sources" in message:
                 with st.expander("Reference Sources", expanded=False):
                     for i, doc in enumerate(message["sources"], start=1):
-                        st.markdown(f"**[{i}] {doc.metadata.get('title', 'Unknown Title')}, ID: {doc.id}**")
-                        st.caption(doc.metadata.get('source', 'Unknown Source'))
+                        st.markdown(f"**[{i}] {get_doc_title(doc)}, ID: {doc.id}**")
+                        st.caption(get_doc_source(doc))
                         st.write(doc.page_content)
 
     query = st.chat_input("Enter your question")
@@ -74,6 +82,11 @@ if page == "Question Answering":
                 # start_retrieval = time.time()
                 with st.spinner("Retrieving documents..."):
                     docs = retrieve(query)
+
+                if not docs:
+                    placeholder.markdown("No relevant documents were retrieved from Qdrant.")
+                    st.session_state.messages.append({"role": "assistant", "content": "No relevant documents were retrieved from Qdrant.", "sources": []})
+                    st.stop()
                 # retrieval_time = time.time() - start_retrieval
 
                 context = format_context(docs)   
@@ -94,8 +107,8 @@ if page == "Question Answering":
 
                 with st.expander("Reference Sources", expanded=False):
                     for i, doc in enumerate(docs, start=1):
-                        st.markdown(f"**[{i}] {doc.metadata.get('title', 'Unknown Title')}, ID: {doc.id}**")
-                        st.caption(doc.metadata.get('source', 'Unknown Source'))
+                        st.markdown(f"**[{i}] {get_doc_title(doc)}, ID: {doc.id}**")
+                        st.caption(get_doc_source(doc))
                         st.write(doc.page_content)
 
                 st.session_state.messages.append({"role": "assistant", "content": full_response, "sources": docs})  # Save the assistant's response in session state

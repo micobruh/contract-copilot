@@ -1,11 +1,11 @@
 from .bm25 import (
-    load_bm25_docs,
     load_bm25_retriever,
     bm25_retrieval,
 )
 
 from .hybrid_search import (
     add_rrf_scores,
+    hybrid_retrieval,
     rrf_fuse,
 )
 
@@ -20,10 +20,10 @@ from .vector_search import (
 )
 
 __all__ = [
-    "load_bm25_docs",
     "load_bm25_retriever",
     "bm25_retrieval",
     "add_rrf_scores",
+    "hybrid_retrieval",
     "rrf_fuse",
     "retrieve",
     "format_context",

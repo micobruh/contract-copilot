@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -10,7 +11,7 @@ from langchain_docling.loader import DoclingLoader, ExportType
 
 PAGE_BREAK = "<<<PAGE_BREAK>>>"
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-TOKENIZER = AutoTokenizer.from_pretrained(EMBED_MODEL_ID)
+DEFAULT_CORPUS_DIR = Path("data/raw/CUAD_v1/full_contract_pdf")
 
 
 # ---------- Regexes ----------
@@ -26,12 +27,25 @@ SECTION_XY_RE = re.compile(
     r"(?im)^Section\s+(\d+\.\d+)\s+(.{1,140}?)(?:\.\s*$|\s*$)"
 )
 
+ROMAN_SECTION_RE = re.compile(
+    r"(?im)^##\s*([IVXLC]+)\.\s+(.{1,120}?)\s*$"
+)
+PARAGRAPH_SECTION_RE = re.compile(
+    r"(?im)^(?:##\s*)?§\s*(\d+(?:\.\d+)*)\s+(.{1,160}?)(?=\s*\(\d+\)\s+|\.\s*$|$)"
+)
+LETTER_SECTION_RE = re.compile(
+    r"(?im)^(?:##\s*)?([A-Z])\.\s+(.{1,160})$"
+)
+
 # Optional secondary splitters inside long sections
 LETTER_SUBUNIT_RE = re.compile(
     r"(?im)^\(([a-z])\)\s+([^.\n]{1,100})(?:\.)?(?:\s|$)"
 )
 ROMAN_SUBUNIT_RE = re.compile(
-    r"(?im)^\(((?:ix|iv|v?i{1,3}|x))\)\s+([^;\n.]{1,120})(?:[.;])?(?:\s|$)"
+    r"(?im)^\(((?:ix|iv|v?i{1,3}|x))\)\s+([^.\n:;]{1,120})(?:[.:;])?(?:\s|$)"
+)
+NUMBERED_ITEM_START_RE = re.compile(
+    r"(?im)^\((\d+)\)\s+(.{1,120}?)(?=\.\s|:\s|$)"
 )
 
 ENTITY_SUFFIXES = (
@@ -170,12 +184,16 @@ def extract_all_companies_from_intro(text: str) -> List[str]:
 
 # ---------- Token helpers ----------
 
+@lru_cache(maxsize=1)
+def get_tokenizer():
+    return AutoTokenizer.from_pretrained(EMBED_MODEL_ID)
+
 def count_tokens(text: str) -> int:
-    return len(TOKENIZER.encode(text, add_special_tokens=False))
+    return len(get_tokenizer().encode(text, add_special_tokens=False))
 
 
 def decode_tokens(token_ids: List[int]) -> str:
-    return TOKENIZER.decode(token_ids, skip_special_tokens=True).strip()
+    return get_tokenizer().decode(token_ids, skip_special_tokens=True).strip()
 
 
 # ---------- Normalization ----------
@@ -194,11 +212,36 @@ def strip_parser_artifacts(text: str) -> str:
     return text
 
 
-def inject_heading_breaks(text: str) -> str:
-    # Article headings
-    text = re.sub(r'(?<!\n)(ARTICLE\s+[IVXLC]+\b)', r'\n\1', text, flags=re.IGNORECASE)
+def promote_paragraph_section_headings(text: str) -> str:
+    return re.sub(
+        r'(?im)^(?!##\s)(§\s*\d+(?:\.\d+)*\s+.{1,160}?)(?:\s*(?=\(\d+\))|\s*$)',
+        r'## \1',
+        text,
+    )
 
-    # Section headings
+
+def build_parent_heading_prefix(unit: Dict[str, Any]) -> str:
+    parts = []
+
+    if unit.get("roman_section_number") and unit.get("roman_section_title"):
+        parts.append(f"## {unit['roman_section_number']}. {unit['roman_section_title']}")
+
+    if unit.get("section_number") and unit.get("section_title"):
+        parts.append(f"## § {unit['section_number']} {unit['section_title']}")
+
+    return "\n".join(parts).strip()
+
+
+def inject_heading_breaks(text: str) -> str:
+    # ARTICLE headings
+    text = re.sub(
+        r'(?<!\n)(ARTICLE\s+[IVXLC]+\b)',
+        r'\n\1',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Section X.Y headings
     text = re.sub(
         r'(?<!\n)(Section\s+\d+\.\d+\s+)',
         r'\n\1',
@@ -206,12 +249,77 @@ def inject_heading_breaks(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Standalone roman/letter subunits
-    text = re.sub(r'(?<!\n)(\([a-z]\)\s+)', r'\n\1', text, flags=re.IGNORECASE)
-    text = re.sub(r'(?<!\n)(\((?:ix|iv|v?i{1,3}|x)\)\s+)', r'\n\1', text, flags=re.IGNORECASE)
+    # Roman markdown headings
+    text = re.sub(
+        r'(?<!\n)(##\s*[IVXLC]+\.\s+[A-Z])',
+        r'\n\1',
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    # Ensure article titles are separated from ARTICLE line if OCR glues them
-    text = re.sub(r'(?m)^(ARTICLE\s+[IVXLC]+)\s+([A-Z][A-Z\s&,-]{3,})$', r'\1\n\2', text)
+    # Only markdown-prefixed § headings
+    text = re.sub(
+        r'(?<!\n)(##\s*§\s*\d+(?:\.\d+)*\s+[A-Z])',
+        r'\n\1',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Optional numbered list items only at obvious boundaries
+    text = re.sub(r'(?<!\n)(\(\d+\)\s+)', r'\n\1', text)
+
+    # Then promote bare § headings only if already at line start
+    text = promote_paragraph_section_headings(text)
+
+    return text
+
+
+def inject_paragraph_section_breaks(text: str) -> str:
+    # Insert a newline before bare § headings only when they look like real headings,
+    # not inline references like "(see above § 3)".
+    text = re.sub(
+        r'(?<!\n)(§\s*\d+(?:\.\d+)*\s+[A-Z][^\n]{1,120}?)(?=\s+\(\d+\)|\.\s|$)',
+        r'\n\1',
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+def normalize_missing_space_after_number_period(text: str) -> str:
+    """
+    Fix cases like:
+      ## 5.Term of this Agreement   -> ## 5. Term of this Agreement
+      13.5Governing Law             -> 13.5 Governing Law   (optional)
+      § 4Independence               -> § 4 Independence     (optional)
+    """
+
+    # Top-level numbered headings: 5.Term -> 5. Term
+    text = re.sub(
+        r'(?m)^(\s*##\s*\d+)\.([A-Za-z])',
+        r'\1. \2',
+        text,
+    )
+
+    # Bare top-level headings without ##
+    text = re.sub(
+        r'(?m)^(\s*\d+)\.([A-Za-z])',
+        r'\1. \2',
+        text,
+    )
+
+    # Optional: subsection headings like 13.5Governing -> 13.5 Governing
+    text = re.sub(
+        r'(?m)^(\s*(?:##\s*)?\d+\.\d+(?:\.\d+)*)\s*([A-Za-z])',
+        r'\1 \2',
+        text,
+    )
+
+    # Optional: § headings like § 4Independence -> § 4 Independence
+    text = re.sub(
+        r'(?m)^(\s*(?:##\s*)?§\s*\d+(?:\.\d+)*)\s*([A-Za-z])',
+        r'\1 \2',
+        text,
+    )
 
     return text
 
@@ -257,6 +365,51 @@ def normalize_inline_subsection_prefixes(text: str) -> str:
     return text
 
 
+def normalize_section_sign_headings(text: str) -> str:
+    """
+    Fix OCR/markdown issues around § headings.
+
+    Examples:
+    ## § 9 Final provisions(1) Force majeure
+    -> ## § 9 Final provisions
+       (1) Force majeure
+
+    ##§ 8 Foo
+    -> ## § 8 Foo
+    """
+    # Normalize spacing after ##
+    text = re.sub(r'(?im)^##\s*§', '## §', text)
+
+    # Put newline before markdown § heading if glued after previous text
+    text = re.sub(r'(?<!\n)(##\s*§\s*\d+(?:\.\d+)*)', r'\n\1', text, flags=re.IGNORECASE)
+
+    # Put newline between § heading title and first numbered item if glued
+    text = re.sub(
+        r'(?im)^(##\s*§\s*\d+(?:\.\d+)*\s+.*?)(\(\d+\)\s+)',
+        r'\1\n\2',
+        text,
+    )
+
+    # Also support bare § headings
+    text = re.sub(
+        r'(?im)^(§\s*\d+(?:\.\d+)*\s+.*?)(\(\d+\)\s+)',
+        r'\1\n\2',
+        text,
+    )
+
+    return text
+
+
+def inject_numbered_item_breaks(text: str) -> str:
+    """
+    Ensure numbered items start on a new line when OCR glued them inline.
+    """
+    # If a numbered item appears after prose, split it to a new line
+    text = re.sub(r'(?<!\n)\s(\((?:\d+)\)\s+)', r'\n\1', text)
+
+    return text
+
+
 def promote_top_level_section_headers(text: str) -> str:
     return re.sub(
         r'(?m)^(?!(##\s))(\d{1,2}\.\s+(?!\d)[^\n]{1,200})$',
@@ -283,8 +436,12 @@ def normalize_text(text: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
 
+    text = normalize_missing_space_after_number_period(text)
+
     text = strip_parser_artifacts(text)
     text = inject_heading_breaks(text)
+    text = normalize_section_sign_headings(text)
+    text = inject_numbered_item_breaks(text)
 
     text = normalize_false_markdown_subsection_headers(text)
     text = normalize_broken_subsection_numbers(text)
@@ -292,12 +449,9 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"\s+\.", ".", text)
-    text = re.sub(r"\(\s*([a-z])\s*\)", r"(\1)", text, flags=re.IGNORECASE)    
+    text = re.sub(r"\(\s*([a-zivx\d]+)\s*\)", r"(\1)", text, flags=re.IGNORECASE)
 
-    text = re.sub(r"(?m)^(##\s*)(\d+)\.(\S)", r"\1\2. \3", text)
-    text = promote_top_level_section_headers(text)
     text = re.sub(r"(?m)^Appendix\s*$", "## Appendix", text)
-    text = normalize_inline_subsection_prefixes(text)
 
     return text.strip()
 
@@ -322,6 +476,66 @@ def detect_metadata_from_pages(pages: List[Tuple[int, str]]) -> Dict[str, Any]:
         meta["document_title"] = m.group(1).strip()
 
     return meta
+
+
+def extract_path_metadata(source_file: str) -> Dict[str, Any]:
+    path = Path(source_file)
+    parts = path.parts
+
+    dataset = next((part for part in parts if part.endswith("_v1")), None)
+    try:
+        full_contract_index = parts.index("full_contract_pdf")
+    except ValueError:
+        full_contract_index = -1
+
+    part = parts[full_contract_index + 1] if full_contract_index >= 0 and len(parts) > full_contract_index + 1 else None
+    contract_type = parts[full_contract_index + 2] if full_contract_index >= 0 and len(parts) > full_contract_index + 2 else None
+
+    document_id = path.stem
+    return {
+        "document_id": document_id,
+        "source_path": source_file,
+        "file_name": path.name,
+        "dataset": dataset,
+        "corpus": "full_contract_pdf" if full_contract_index >= 0 else None,
+        "part": part,
+        "contract_type": contract_type,
+    }
+
+
+def build_document_metadata(
+    base_metadata: Dict[str, Any],
+    source_file: str,
+    semantic_units: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_metadata = extract_path_metadata(source_file)
+
+    first_text = next(
+        (
+            unit["text"][:2000]
+            for unit in semantic_units
+            if unit.get("section_type") in {"front_matter", "body"} and unit.get("text", "").strip()
+        ),
+        "",
+    )
+
+    companies = dedupe_companies(extract_all_companies_from_intro(first_text))
+    if not companies:
+        inferred_company = infer_company_from_filename(source_file)
+        if inferred_company:
+            companies = [inferred_company]
+
+    document_title = base_metadata.get("document_title") or prettify_title(source_metadata["document_id"])
+
+    return {
+        **base_metadata,
+        **source_metadata,
+        "document_title": document_title,
+        "title": document_title,
+        "company_names": companies,
+        "all_companies": companies,
+        "party_count": len(companies),
+    }
 
 
 # ---------- Format detection ----------
@@ -514,6 +728,27 @@ def split_numeric_section_into_subsections(section: Dict[str, Any]) -> List[Dict
 
 # ---------- Parser 2: ARTICLE / Section X.Y format ----------
 
+def strip_parent_heading_from_prefix(prefix: str, unit: Dict[str, Any]) -> str:
+    text = prefix.strip()
+
+    candidates = []
+
+    if unit.get("roman_section_number") and unit.get("roman_section_title"):
+        candidates.append(f"## {unit['roman_section_number']}. {unit['roman_section_title']}".strip())
+
+    if unit.get("section_number") and unit.get("section_title"):
+        candidates.append(f"## § {unit['section_number']} {unit['section_title']}".strip())
+        candidates.append(f"§ {unit['section_number']} {unit['section_title']}".strip())
+        candidates.append(f"Section {unit['section_number']} {unit['section_title']}".strip())
+        candidates.append(f"## {unit['section_number']}. {unit['section_title']}".strip())
+
+    for heading in candidates:
+        if text.startswith(heading):
+            return text[len(heading): ].strip()
+
+    return text
+
+
 def split_by_marker(
     unit: Dict[str, Any],
     marker_re: re.Pattern,
@@ -529,14 +764,17 @@ def split_by_marker(
     parts = []
 
     first_start = matches[0].start()
-    prefix = text[:first_start].strip()
+    prefix = text[: first_start].strip()
+
     if prefix:
-        parts.append({
-            **unit,
-            label_key: None,
-            title_key: None,
-            "text": prefix,
-        })
+        remainder = strip_parent_heading_from_prefix(prefix, unit)
+        if remainder:
+            parts.append({
+                **unit,
+                label_key: None,
+                title_key: None,
+                "text": prefix,
+            })
 
     for i, match in enumerate(matches):
         start = match.start()
@@ -562,7 +800,7 @@ def clean_heading_title(title: str, max_words: int = 14) -> str:
 def clean_subunit_title(title: str, max_words: int = 10) -> str:
     title = " ".join(title.split()).strip(" .;,:")
     words = title.split()
-    return " ".join(words[:max_words])
+    return " ".join(words[: max_words])
 
 
 def split_article_section_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
@@ -734,6 +972,195 @@ def split_article_section_into_subunits(unit: Dict[str, Any]) -> List[Dict[str, 
     return parts
 
 
+def is_heading_only_unit(unit: Dict[str, Any]) -> bool:
+    text = unit["text"].strip()
+    if unit.get("roman_section_number") and not unit.get("section_number"):
+        heading = f"## {unit['roman_section_number']}. {unit['roman_section_title']}".strip()
+        return text == heading
+    return False
+
+
+def split_roman_paragraph_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+    units: List[Dict[str, Any]] = []
+
+    current_roman_number = None
+    current_roman_title = None
+
+    current = {
+        "section_type": "front_matter",
+        "roman_section_number": None,
+        "roman_section_title": None,
+        "section_number": None,
+        "section_title": "Front Matter",
+        "content_parts": [],
+        "page_numbers": [],
+    }
+
+    def flush_current():
+        nonlocal current
+        if not current["content_parts"]:
+            return
+
+        candidate = {
+            **current,
+            "text": "\n".join(current["content_parts"]).strip(),
+            "page_numbers": sorted(set(current["page_numbers"])),
+        }
+
+        if candidate["text"] and not is_heading_only_unit(candidate):
+            units.append(candidate)
+
+    for page_no, page_text in pages:
+        for raw_line in page_text.splitlines():
+            line = raw_line.strip()
+
+            if not line:
+                if current["content_parts"] and current["content_parts"][-1] != "":
+                    current["content_parts"].append("")
+                continue
+
+            m_roman = ROMAN_SECTION_RE.match(line)
+            if m_roman:
+                flush_current()
+
+                current_roman_number = m_roman.group(1).upper()
+                current_roman_title = clean_heading_title(m_roman.group(2).strip())
+
+                current = {
+                    "section_type": "body",
+                    "roman_section_number": current_roman_number,
+                    "roman_section_title": current_roman_title,
+                    "section_number": None,
+                    "section_title": current_roman_title,
+                    "content_parts": [f"## {current_roman_number}. {current_roman_title}"],
+                    "page_numbers": [page_no],
+                }
+                continue
+
+            m_letter = LETTER_SECTION_RE.match(line)
+            if m_letter:
+                flush_current()
+
+                sec_letter = m_letter.group(1).strip()
+                sec_title = clean_heading_title(m_letter.group(2).strip())
+
+                current = {
+                    "section_type": "body",
+                    "roman_section_number": current_roman_number,
+                    "roman_section_title": current_roman_title,
+                    "section_number": sec_letter,   # <-- important
+                    "section_title": sec_title,
+                    "content_parts": [f"## {sec_letter}. {sec_title}"],
+                    "page_numbers": [page_no],
+                }
+                continue
+
+            m_para = PARAGRAPH_SECTION_RE.match(line)
+            if m_para:
+                flush_current()
+
+                sec_num = m_para.group(1).strip()
+                sec_title = clean_heading_title(m_para.group(2).strip())
+
+                header_parts = []
+                if current_roman_number and current_roman_title:
+                    header_parts.append(f"## {current_roman_number}. {current_roman_title}")
+                header_parts.append(f"## § {sec_num} {sec_title}")
+
+                current = {
+                    "section_type": "body",
+                    "roman_section_number": current_roman_number,
+                    "roman_section_title": current_roman_title,
+                    "section_number": sec_num,
+                    "section_title": sec_title,
+                    "content_parts": header_parts,
+                    "page_numbers": [page_no],
+                }
+                continue
+
+            current["content_parts"].append(line)
+            current["page_numbers"].append(page_no)
+
+    flush_current()
+    return [u for u in units if u["text"].strip()]
+
+
+def split_roman_paragraph_unit_into_subunits(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if unit["section_type"] != "body":
+        return [dict(
+            unit,
+            subunit_label=None,
+            subunit_title=None,
+            roman_subunit_label=None,
+            roman_subunit_title=None,
+        )]
+
+    text = unit["text"]
+    matches = list(NUMBERED_ITEM_START_RE.finditer(text))
+
+    # No numbered children -> keep section as one semantic unit
+    if not matches:
+        return [dict(
+            unit,
+            subunit_label=None,
+            subunit_title=None,
+            roman_subunit_label=None,
+            roman_subunit_title=None,
+        )]
+
+    parent_prefix = build_parent_heading_prefix(unit)
+    out: List[Dict[str, Any]] = []
+
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+
+        block = text[start:end].strip()
+        label = match.group(1).strip()
+        title = clean_subunit_title(match.group(2).strip())
+
+        if parent_prefix and not block.startswith(parent_prefix):
+            block = f"{parent_prefix}\n{block}"
+
+        out.append({
+            **unit,
+            "subunit_label": label,
+            "subunit_title": title,
+            "roman_subunit_label": None,
+            "roman_subunit_title": None,
+            "text": block.strip(),
+        })
+
+    return out
+
+
+def split_roman_children_with_nested_roman(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    numbered_children = split_roman_paragraph_unit_into_subunits(unit)
+    final_units: List[Dict[str, Any]] = []
+
+    for child in numbered_children:
+        matches = list(ROMAN_SUBUNIT_RE.finditer(child["text"]))
+
+        if not matches:
+            final_units.append(child)
+            continue
+
+        # If there are nested roman markers, split them too
+        for i, match in enumerate(matches):
+            start = match.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(child["text"])
+            block = child["text"][start:end].strip()
+
+            final_units.append({
+                **child,
+                "roman_subunit_label": match.group(1).lower(),
+                "roman_subunit_title": clean_subunit_title(match.group(2).strip()),
+                "text": block,
+            })
+
+    return final_units
+
+
 # ---------- Parser 3: paragraph fallback ----------
 
 def split_paragraph_fallback_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
@@ -820,6 +1247,10 @@ def split_appendix_into_blocks(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
     return blocks if blocks else [unit]
 
 
+def count_roman_paragraph_markers(text: str) -> int:
+    return len(ROMAN_SECTION_RE.findall(text)) + len(PARAGRAPH_SECTION_RE.findall(text))
+
+
 def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     pages = split_pages(markdown_text)
     base_metadata = detect_metadata_from_pages(pages)
@@ -827,6 +1258,7 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
 
     article_score = count_article_section_markers(full_text)
     numeric_score = count_numeric_section_markers(full_text)
+    roman_score = count_roman_paragraph_markers(full_text)
 
     semantic_units: List[Dict[str, Any]]
 
@@ -835,6 +1267,11 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
         semantic_units = []
         for unit in top_units:
             semantic_units.extend(split_article_section_into_subunits(unit))
+    elif roman_score >= 2:
+        top_units = split_roman_paragraph_units(pages)
+        semantic_units = []
+        for unit in top_units:
+            semantic_units.extend(split_roman_paragraph_unit_into_subunits(unit))       
     elif numeric_score >= 2:
         top_units = split_numeric_top_sections(pages)
         semantic_units = []
@@ -932,13 +1369,26 @@ def build_final_documents(
         child_ids = [f"{unit['semantic_unit_id']}|chunk|{i+1}" for i in range(len(child_texts))]
 
         for i, child_text in enumerate(child_texts):
+            chunk_id = child_ids[i]
+            page_numbers = unit.get("page_numbers") or []
             docs.append(Document(
+                id=chunk_id,
                 page_content=child_text,
                 metadata={
-                    "chunk_id": child_ids[i],
+                    "chunk_id": chunk_id,
+                    "doc_id": chunk_id,
+                    "document_id": base_metadata.get("document_id"),
                     "semantic_unit_id": unit["semantic_unit_id"],
                     "source": unit["source"],
+                    "source_path": base_metadata.get("source_path"),
+                    "file_name": base_metadata.get("file_name"),
+                    "dataset": base_metadata.get("dataset"),
+                    "corpus": base_metadata.get("corpus"),
+                    "part": base_metadata.get("part"),
+                    "contract_type": base_metadata.get("contract_type"),
                     "document_title": base_metadata.get("document_title"),
+                    "title": base_metadata.get("title"),
+                    "company_names": base_metadata.get("company_names"),
                     "all_companies": base_metadata.get("all_companies"),
                     "party_count": base_metadata.get("party_count"),
                     "section_type": unit.get("section_type"),
@@ -946,13 +1396,17 @@ def build_final_documents(
                     "article_title": unit.get("article_title"),
                     "section_number": unit.get("section_number"),
                     "section_title": unit.get("section_title"),
+                    "roman_section_number": unit.get("roman_section_number"),
+                    "roman_section_title": unit.get("roman_section_title"),
                     "subsection_number": unit.get("subsection_number"),
                     "subsection_title": unit.get("subsection_title"),
                     "subunit_label": unit.get("subunit_label"),
                     "subunit_title": unit.get("subunit_title"),
                     "roman_subunit_label": unit.get("roman_subunit_label"),
-                    "roman_subunit_title": unit.get("roman_subunit_title"),                    
-                    "page_numbers": unit.get("page_numbers"),
+                    "roman_subunit_title": unit.get("roman_subunit_title"),
+                    "page_numbers": page_numbers,
+                    "page_start": page_numbers[0] if page_numbers else None,
+                    "page_end": page_numbers[-1] if page_numbers else None,
                     "semantic_unit_token_count": unit.get("semantic_unit_token_count"),
                     "token_count": count_tokens(child_text),
                     "child_chunk_index": i + 1,
@@ -967,7 +1421,12 @@ def build_final_documents(
 
 # ---------- Loader ----------
 
-def load_pdf(relative_path: str, max_tokens: int = 256, overlap_tokens: int = 40) -> List[Document]:
+def load_pdf(
+    relative_path: str,
+    max_tokens: int = 256,
+    overlap_tokens: int = 40,
+    debug: bool = False,
+) -> List[Document]:
     root_path = Path(__file__).resolve().parents[3]
     pdf_path = root_path / Path(relative_path)
     assert pdf_path.exists(), f"File not found: {pdf_path}"
@@ -980,64 +1439,81 @@ def load_pdf(relative_path: str, max_tokens: int = 256, overlap_tokens: int = 40
         },
     )
 
+    # for doc in loader.load():
+    #     print(doc.page_content)
+
     raw_docs = loader.load()
     if not raw_docs:
         return []
 
     markdown_text = raw_docs[0].page_content
     semantic_units, base_metadata = build_semantic_units(markdown_text, str(relative_path))
-
-    for unit in semantic_units:
-        if unit["section_type"] in {"front_matter", "body"} and unit["text"].strip():
-            first_text = unit["text"][: 2000]
-            break
-
-    companies = extract_all_companies_from_intro(first_text)
-    company_info = {
-        "document_title": base_metadata.get("document_title"),
-        "all_companies": companies,
-        "party_count": len(companies),
-    }       
-    base_metadata.update(company_info)   
+    document_metadata = build_document_metadata(base_metadata, str(relative_path), semantic_units)
 
     docs = build_final_documents(
         semantic_units=semantic_units,
-        base_metadata=base_metadata,
+        base_metadata=document_metadata,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
     )
 
-    print(f"Built {len(semantic_units)} semantic units.")
-    for i, unit in enumerate(semantic_units, start=1):
-        print("-" * 80)
-        print(f"Unit {i}")
-        print(f"Document Title: {base_metadata.get('document_title')}")
-        print(f"All Companies: {base_metadata.get('all_companies')}")
-        print(f"Party Count: {base_metadata.get('party_count')}")
-        print(f"Source: {unit['source']}")
-        print(f"Semantic Unit ID: {unit['semantic_unit_id']})")
-        print(f"Article: {unit.get('article_number')} - {unit.get('article_title')}")
-        print(f"Section: {unit.get('section_number')} - {unit.get('section_title')}")
-        print(f"Subsection: {unit.get('subsection_number')} - {unit.get('subsection_title')}")
-        print(f"Roman Subunit: {unit.get('roman_subunit_label')} - {unit.get('roman_subunit_title')}")
-        print(f"Subunit: {unit.get('subunit_label')} - {unit.get('subunit_title')}")
-        print(f"Token Count: {unit['semantic_unit_token_count']}")
-        print(unit["text"])
-
-    # print(f"Built {len(docs)} final chunks from {len(semantic_units)} semantic units.")
-    # for i, d in enumerate(docs, start=1):
-    #     print("-" * 80)
-    #     print(f"Chunk {i}")
-    #     print(d.metadata)
-    #     print(d.page_content)
+    if debug:
+        print(f"Built {len(semantic_units)} semantic units and {len(docs)} chunks.")
+        for i, unit in enumerate(semantic_units, start=1):
+            print("-" * 80)
+            print(f"Unit {i}")
+            print(f"Document Title: {document_metadata.get('document_title')}")
+            print(f"Company Names: {document_metadata.get('company_names')}")
+            print(f"Party Count: {document_metadata.get('party_count')}")
+            print(f"Source: {unit['source']}")
+            print(f"Semantic Unit ID: {unit['semantic_unit_id']}")
+            print(f"Article: {unit.get('article_number')} - {unit.get('article_title')}")
+            print(f"Section: {unit.get('section_number')} - {unit.get('section_title')}")
+            print(f"Roman Section: {unit.get('roman_section_number')} - {unit.get('roman_section_title')}")
+            print(f"Subsection: {unit.get('subsection_number')} - {unit.get('subsection_title')}")
+            print(f"Roman Subunit: {unit.get('roman_subunit_label')} - {unit.get('roman_subunit_title')}")
+            print(f"Subunit: {unit.get('subunit_label')} - {unit.get('subunit_title')}")
+            print(f"Token Count: {unit['semantic_unit_token_count']}")
+            print(unit["text"])
 
     return docs
 
 
-# relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CreditcardscomInc_20070810_S-1_EX-10.33_362297_EX-10.33_Affiliate Agreement.pdf"
-# relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CybergyHoldingsInc_20140520_10-Q_EX-10.27_8605784_EX-10.27_Affiliate Agreement.pdf"
-# relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/DigitalCinemaDestinationsCorp_20111220_S-1_EX-10.10_7346719_EX-10.10_Affiliate Agreement.pdf"
-relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/LinkPlusCorp_20050802_8-K_EX-10_3240252_EX-10_Affiliate Agreement.pdf"
-# relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/IP/ArmstrongFlooringInc_20190107_8-K_EX-10.2_11471795_EX-10.2_Intellectual Property Agreement.pdf"
-load_pdf(relative_path)
-# python src/contract_copilot/indexer/ocr_loader.py
+def iter_corpus_pdf_paths(corpus_dir: str | Path = DEFAULT_CORPUS_DIR) -> List[str]:
+    root_path = Path(__file__).resolve().parents[3]
+    corpus_path = root_path / Path(corpus_dir)
+    if not corpus_path.exists():
+        raise FileNotFoundError(f"Corpus directory not found: {corpus_path}")
+
+    pdf_paths = [
+        path.relative_to(root_path).as_posix()
+        for path in corpus_path.rglob("*")
+        if path.is_file() and path.suffix.lower() == ".pdf"
+    ]
+    return sorted(pdf_paths)
+
+
+def load_corpus(
+    corpus_dir: str | Path = DEFAULT_CORPUS_DIR,
+    max_tokens: int = 256,
+    overlap_tokens: int = 40,
+    max_documents: Optional[int] = None,
+    debug: bool = False,
+) -> List[Document]:
+    documents: List[Document] = []
+    pdf_paths = iter_corpus_pdf_paths(corpus_dir)
+
+    if max_documents is not None:
+        pdf_paths = pdf_paths[:max_documents]
+
+    for relative_path in pdf_paths:
+        documents.extend(
+            load_pdf(
+                relative_path=relative_path,
+                max_tokens=max_tokens,
+                overlap_tokens=overlap_tokens,
+                debug=debug,
+            )
+        )
+
+    return documents

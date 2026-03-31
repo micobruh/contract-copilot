@@ -1,6 +1,6 @@
 from .vector_search import vector_similarity_search
 from .bm25 import bm25_retrieval
-from .hybrid_search import rrf_fuse
+from .hybrid_search import hybrid_retrieval
 from ..config import config
 from ..model.reranker import rerank
 
@@ -21,9 +21,7 @@ def retrieve(
     elif search_method == "bm25":
         docs_before_ranking = bm25_retrieval(query, k_bm25=k_bm25)
     elif search_method == "hybrid":    
-        vector_docs = vector_similarity_search(query, embedding_model_name=embedding_model_name, k_vector=k_vector)
-        bm25_docs = bm25_retrieval(query, k_bm25=k_bm25)
-        docs_before_ranking = rrf_fuse(vector_docs, bm25_docs, k_rrf=k_rrf)
+        docs_before_ranking = hybrid_retrieval(query, embedding_model_name=embedding_model_name, k_rrf=k_rrf)
     else:
         raise ValueError(f"Invalid search method: {search_method}")     
     
@@ -35,8 +33,8 @@ def retrieve(
 def format_context(docs):
     parts = []
     for i, doc in enumerate(docs, 1):
-        title = doc.metadata.get("title", "Unknown")
-        source = doc.metadata.get("source", "")
+        title = doc.metadata.get("title") or doc.metadata.get("document_title") or "Unknown"
+        source = doc.metadata.get("source") or doc.metadata.get("source_path") or ""
         parts.append(
             f"[{i}] Title: {title}\n"
             f"Source: {source}\n"

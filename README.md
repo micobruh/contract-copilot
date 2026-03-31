@@ -22,6 +22,9 @@ docker compose up --build
 ```
 
 The app container uses `OLLAMA_HOST=http://ollama:11434` to reach the Ollama service.
+The Qdrant index is stored locally inside the app container under `/app/artifacts/qdrant_db`
+and is persisted through the `./artifacts:/app/artifacts` volume mount, so no separate
+Qdrant container is required for this setup.
 
 Use the command above as the CPU-safe default. It will still run on machines with no GPU.
 

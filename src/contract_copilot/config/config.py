@@ -11,8 +11,7 @@ class AppConfig:
     embedding_batch_size: int
     rerank_batch_size: int
     collection_name: str
-    bm25_doc_link: str
-    chroma_db_link: str
+    qdrant_db_link: str
     embedding_models_root: str
     reranker_models_root: str
     default_embedding_model_name: str
