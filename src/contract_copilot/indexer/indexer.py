@@ -42,7 +42,7 @@ def store_documents_in_batches(documents, embedding_wrapper, storing_batch_size=
     client = QdrantClient(path=config.qdrant_db_link)
 
     if documents:
-        sample_vector = embedding_wrapper.embed_query(documents[0].page_content)
+        sample_vector = embedding_wrapper.embed_documents([documents[0].page_content])[0]
         client.recreate_collection(
             collection_name=config.collection_name,
             vectors_config={
@@ -62,7 +62,9 @@ def store_documents_in_batches(documents, embedding_wrapper, storing_batch_size=
         try:
             max_document_index = min(min_document_index + storing_batch_size, total_chunks)
             batch_documents = documents[min_document_index: max_document_index]
-            batch_dense_vectors = embedding_wrapper.embed_documents([doc.page_content for doc in batch_documents])
+            batch_texts = [doc.page_content for doc in batch_documents]
+            batch_dense_vectors = embedding_wrapper.embed_documents(batch_texts)
+            batch_sparse_vectors = [encode_sparse_text(text) for text in batch_texts]
             batch_points = [
                 PointStruct(
                     id=doc.id or doc.metadata["chunk_id"],
@@ -81,7 +83,7 @@ def store_documents_in_batches(documents, embedding_wrapper, storing_batch_size=
                 for doc, dense_vector, (sparse_indices, sparse_values) in zip(
                     batch_documents,
                     batch_dense_vectors,
-                    [encode_sparse_text(doc.page_content) for doc in batch_documents],
+                    batch_sparse_vectors,
                 )
             ]
             client.upsert(

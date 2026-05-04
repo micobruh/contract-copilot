@@ -7,9 +7,11 @@ services:
       - "8501:8501"
     environment:
       OLLAMA_HOST: http://ollama:11434
+      EMBEDDING_MODELS_ROOT: /app/shared_models/embedding_models
+      RERANKER_MODELS_ROOT: /app/shared_models/reranker_models
     volumes:
       - ./artifacts:/app/artifacts
-      - ./local_models:/app/local_models
+      - /home/marco/shared_models:/app/shared_models
     depends_on:
       - ollama
 

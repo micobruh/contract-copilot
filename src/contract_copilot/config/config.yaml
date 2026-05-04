@@ -1,11 +1,13 @@
 ---
-storing_batch_size: 64
+storing_batch_size: 128
 embedding_batch_size: 32
+cpu_num_threads: 6
+cpu_num_interop_threads: 1
 rerank_batch_size: 16
 collection_name: "Law_RAG"
 qdrant_db_link: "./artifacts/qdrant_db"
-embedding_models_root: "./local_models/embedding_models"
-reranker_models_root: "./local_models/reranker_models"
+embedding_models_root: "/home/marco/shared_models/embedding_models"
+reranker_models_root: "/home/marco/shared_models/reranker_models"
 default_embedding_model_name: "BAAI/bge-m3" # Options: BAAI/bge-m3, Qwen/Qwen3-Embedding-4B, jinaai/jina-embeddings-v5-text-small
 default_reranker_model_name: "BAAI/bge-reranker-base"
 default_llm_model_name: "phi3" # Options: phi3, qwen, deepseek-r1:1.5b

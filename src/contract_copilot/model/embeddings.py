@@ -4,7 +4,12 @@ from transformers import AutoTokenizer, AutoModel
 from langchain_core.embeddings import Embeddings
 import streamlit as st
 from ..config import config
-from ..utils.utils import determine_device, determine_dtype, determine_model_path
+from ..utils.utils import (
+    configure_torch_threads,
+    determine_device,
+    determine_dtype,
+    determine_model_path,
+)
 
 
 class UniversalEmbeddingModel:
@@ -13,6 +18,11 @@ class UniversalEmbeddingModel:
 
         self.device = determine_device()
         self.dtype = determine_dtype(self.device)
+        configure_torch_threads(
+            self.device,
+            config.cpu_num_threads,
+            config.cpu_num_interop_threads,
+        )
 
         self.embedding_model_path_str = determine_model_path(
             self.embedding_model_name,
@@ -53,7 +63,7 @@ class UniversalEmbeddingModel:
             ).to(self.device)
             self.model.eval()
 
-    def encode(self, texts):
+    def encode_documents(self, texts):
         if isinstance(texts, str):
             texts = [texts]
 
@@ -61,7 +71,7 @@ class UniversalEmbeddingModel:
             if self.embedding_model_name == "Qwen/Qwen3-Embedding-4B":
                 return self.model.encode(
                     texts,
-                    prompt_name="query",
+                    prompt_name="document",
                     batch_size=config.embedding_batch_size,
                     show_progress_bar=False,
                     convert_to_numpy=True,
@@ -74,24 +84,42 @@ class UniversalEmbeddingModel:
             )
 
         elif self.backend == "transformers":
-            with torch.no_grad():
+            with torch.inference_mode():
                 return self.model.encode(
                     texts=texts,
                     task="retrieval",
                     prompt_name="document",
                 )
-    
+
+    def encode_query(self, text):
+        if self.backend == "sentence_transformer":
+            encode_kwargs = {
+                "batch_size": config.embedding_batch_size,
+                "show_progress_bar": False,
+                "convert_to_numpy": True,
+            }
+            if self.embedding_model_name == "Qwen/Qwen3-Embedding-4B":
+                encode_kwargs["prompt_name"] = "query"
+            return self.model.encode([text], **encode_kwargs)
+
+        with torch.inference_mode():
+            return self.model.encode(
+                texts=[text],
+                task="retrieval",
+                prompt_name="query",
+            )
+
 
 class LocalEmbeddingWrapper(Embeddings):
     def __init__(self, model):
         self.model = model
 
     def embed_documents(self, texts):
-        embeddings = self.model.encode(texts)
+        embeddings = self.model.encode_documents(texts)
         return embeddings.tolist()
 
     def embed_query(self, text):
-        embedding = self.model.encode(text)[0]
+        embedding = self.model.encode_query(text)[0]
         return embedding.tolist()
     
 

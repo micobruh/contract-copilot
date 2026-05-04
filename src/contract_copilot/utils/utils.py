@@ -1,5 +1,5 @@
-import torch
 from pathlib import Path
+import torch
 
 
 def determine_device():
@@ -31,11 +31,19 @@ def determine_dtype(device):
     return torch.float16
 
 
+def configure_torch_threads(device, num_threads, num_interop_threads):
+    if device != "cpu":
+        return
+
+    torch.set_num_threads(max(1, num_threads))
+    torch.set_num_interop_threads(max(1, num_interop_threads))
+
+
 def determine_model_path(model_name, local_model_map, models_root):
     if model_name not in local_model_map:
         raise ValueError(f"Unsupported model: {model_name}")
 
-    model_path = Path(f"./{models_root}/{local_model_map[model_name]}")
+    model_path = Path(models_root).expanduser() / local_model_map[model_name]
 
     if not model_path.exists():
         raise FileNotFoundError(

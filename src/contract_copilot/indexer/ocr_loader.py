@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Tuple, Optional
 
 from transformers import AutoTokenizer
 from langchain_core.documents import Document
-from langchain_docling.loader import DoclingLoader, ExportType
+import pymupdf4llm
 
 
 PAGE_BREAK = "<<<PAGE_BREAK>>>"
@@ -16,17 +16,23 @@ DEFAULT_CORPUS_DIR = Path("data/raw/CUAD_v1/full_contract_pdf")
 
 # ---------- Regexes ----------
 
-# Previous format
+# Parser experiment: CUAD has contracts with plain numeric headings like
+# "1. Term". If PyMuPDF4LLM heading markdown is reliable enough, try disabling
+# this parser path and compare chunk boundaries.
 TOP_SECTION_RE = re.compile(
     r"(?m)^(?:##\s*)?(\d{1,2})\.\s+(?!\d)([^\n]{1,200})$"
 )
 
-# New format
-ARTICLE_RE = re.compile(r"(?m)^ARTICLE\s+([IVXLC]+)\s*$", re.IGNORECASE)
+# Parser experiment: detects "ARTICLE I" + "Section 1.1 Title" contracts.
+# This is format-specific legal-structure logic, not generic cleanup.
+ARTICLE_RE = re.compile(r"(?m)^(?:##\s*)?ARTICLE\s+([IVXLC]+)\s*$", re.IGNORECASE)
 SECTION_XY_RE = re.compile(
-    r"(?im)^Section\s+(\d+\.\d+)\s+(.{1,140}?)(?:\.\s*$|\s*$)"
+    r"(?im)^(?:##\s*)?Section\s+(\d+\.\d+)\s+(.{1,140}?)(?:\.\s*$|\s*$)"
 )
 
+# Parser experiment: detects German/European-style structures such as
+# "## I. General" followed by "§ 1 Scope" or "A. Definitions".
+# Disable this path if PyMuPDF4LLM now gives more consistent headings.
 ROMAN_SECTION_RE = re.compile(
     r"(?im)^##\s*([IVXLC]+)\.\s+(.{1,120}?)\s*$"
 )
@@ -37,7 +43,9 @@ LETTER_SECTION_RE = re.compile(
     r"(?im)^(?:##\s*)?([A-Z])\.\s+(.{1,160})$"
 )
 
-# Optional secondary splitters inside long sections
+# Parser experiment: optional fine-grained splits inside long sections.
+# These are intentionally conservative but can over-split body text if current
+# parser output already provides good paragraph/chunk boundaries.
 LETTER_SUBUNIT_RE = re.compile(
     r"(?im)^\(([a-z])\)\s+([^.\n]{1,100})(?:\.)?(?:\s|$)"
 )
@@ -52,6 +60,9 @@ ENTITY_SUFFIXES = (
     r'Inc\.?|LLC|L\.L\.C\.|Corp\.?|Corporation|Company|Ltd\.?|Limited|'
     r'LP|L\.P\.|LLP|L\.L\.P\.|PLC|Bank|N\.A\.|National Association'
 )
+# Parser experiment: company extraction is tuned to legal intro blocks and
+# entity suffixes. It only affects metadata, so it is safe to compare with this
+# disabled if file-name metadata is enough.
 LEGAL_ENTITY_RE = re.compile(
     rf"""
     (?<![A-Za-z0-9&])
@@ -79,12 +90,8 @@ BAD_SUBSTRINGS = [
     "agreement",
 ]
 
+# Parser experiment: appendix handling is specific to CUAD exhibits/appendices.
 APPENDIX_HEADING_RE = re.compile(r"(?im)^##\s*Appendix\s*$|^Appendix\s*$")
-APPENDIX_SUBHEAD_RE = re.compile(
-    r"(?im)^##\s+(.+)$|^([A-Z][A-Za-z0-9/&'\"(). -]{2,120})$"
-)
-
-
 # ---------- Company finder ----------
 
 def infer_company_from_filename(file_path: str) -> str | None:
@@ -114,6 +121,9 @@ def prettify_title(title: str | None) -> str | None:
 def clean_company_name(name: str) -> str:
     name = " ".join(name.split()).strip(" ,;.")
 
+    # Parser experiment: legacy cleanup for party names swallowed from noisy
+    # introductions. Try removing if PyMuPDF4LLM text makes party extraction
+    # stable without these tail trims.
     # Remove OCR-ish aliases / quoted labels
     name = re.sub(r'\([^)]{0,60}\)$', '', name).strip(" ,;.")
 
@@ -126,26 +136,6 @@ def clean_company_name(name: str) -> str:
     ).strip(" ,;.")
 
     return name
-
-
-def looks_like_real_company(name: str) -> bool:
-    if not name:
-        return False
-
-    lowered = name.lower()
-
-    if any(bad in lowered for bad in BAD_SUBSTRINGS):
-        return False
-
-    # Must end with a legal suffix
-    if not re.search(r'\b(inc\.?|llc|corp\.?|corporation|company|ltd\.?|limited)\b$', lowered):
-        return False
-
-    # Too long usually means it swallowed prose
-    if len(name.split()) > 8:
-        return False
-
-    return True
 
 
 def dedupe_companies(companies: List[str]) -> List[str]:
@@ -199,6 +189,8 @@ def decode_tokens(token_ids: List[int]) -> str:
 # ---------- Normalization ----------
 
 def strip_parser_artifacts(text: str) -> str:
+    # Parser experiment: this targets older parser/source banners and standalone
+    # page numbers. PyMuPDF4LLM may make the source-line removal unnecessary.
     # Remove parser/source lines
     text = re.sub(
         r'(?m)^Source:\s+.*?<PARSED TEXT FOR PAGE:\s*\d+\s*/\s*\d+>\s*',
@@ -212,7 +204,26 @@ def strip_parser_artifacts(text: str) -> str:
     return text
 
 
+def normalize_markdown_heading_markup(text: str) -> str:
+    """
+    PyMuPDF4LLM may wrap bold headings in Markdown emphasis markers.
+    Unwrap whole-line emphasis so structural regexes see the heading text,
+    while preserving inline emphasis inside normal prose.
+    """
+    normalized_lines = []
+    for line in text.splitlines():
+        line = re.sub(
+            r"^(\s*#{1,6}\s*)?(\*\*|__|\*|_)(\S(?:.*?\S)?)\2\s*$",
+            r"\1\3",
+            line,
+        )
+        normalized_lines.append(line)
+    return "\n".join(normalized_lines)
+
+
 def promote_paragraph_section_headings(text: str) -> str:
+    # Parser experiment: promotes bare "§ 1 Title" lines into markdown headings.
+    # Try disabling if PyMuPDF4LLM already emits reliable markdown headings.
     return re.sub(
         r'(?im)^(?!##\s)(§\s*\d+(?:\.\d+)*\s+.{1,160}?)(?:\s*(?=\(\d+\))|\s*$)',
         r'## \1',
@@ -233,9 +244,12 @@ def build_parent_heading_prefix(unit: Dict[str, Any]) -> str:
 
 
 def inject_heading_breaks(text: str) -> str:
+    # Parser experiment: repair step for headings/list items glued onto prose.
+    # With cleaner PyMuPDF4LLM output, this may be the first normalization to
+    # test without.
     # ARTICLE headings
     text = re.sub(
-        r'(?<!\n)(ARTICLE\s+[IVXLC]+\b)',
+        r'(?<!\n)(?<!## )(ARTICLE\s+[IVXLC]+\b)',
         r'\n\1',
         text,
         flags=re.IGNORECASE,
@@ -243,7 +257,7 @@ def inject_heading_breaks(text: str) -> str:
 
     # Section X.Y headings
     text = re.sub(
-        r'(?<!\n)(Section\s+\d+\.\d+\s+)',
+        r'(?<!\n)(?<!## )(Section\s+\d+\.\d+\s+)',
         r'\n\1',
         text,
         flags=re.IGNORECASE,
@@ -274,17 +288,6 @@ def inject_heading_breaks(text: str) -> str:
     return text
 
 
-def inject_paragraph_section_breaks(text: str) -> str:
-    # Insert a newline before bare § headings only when they look like real headings,
-    # not inline references like "(see above § 3)".
-    text = re.sub(
-        r'(?<!\n)(§\s*\d+(?:\.\d+)*\s+[A-Z][^\n]{1,120}?)(?=\s+\(\d+\)|\.\s|$)',
-        r'\n\1',
-        text,
-        flags=re.IGNORECASE,
-    )
-    return text
-
 def normalize_missing_space_after_number_period(text: str) -> str:
     """
     Fix cases like:
@@ -293,6 +296,8 @@ def normalize_missing_space_after_number_period(text: str) -> str:
       § 4Independence               -> § 4 Independence     (optional)
     """
 
+    # Parser experiment: legacy repair for glued OCR headings. If the new parser
+    # rarely emits "5.Term" or "13.5Governing", disable this whole function.
     # Top-level numbered headings: 5.Term -> 5. Term
     text = re.sub(
         r'(?m)^(\s*##\s*\d+)\.([A-Za-z])',
@@ -325,6 +330,8 @@ def normalize_missing_space_after_number_period(text: str) -> str:
 
 
 def normalize_false_markdown_subsection_headers(text: str) -> str:
+    # Parser experiment: repairs parser-created false headings such as
+    # "## 13. 5 Governing" back into "13.5 Governing".
     prev = None
     while prev != text:
         prev = text
@@ -342,6 +349,8 @@ def normalize_false_markdown_subsection_headers(text: str) -> str:
 
 
 def normalize_broken_subsection_numbers(text: str) -> str:
+    # Parser experiment: another OCR/parser repair for split subsection numbers
+    # like "13. 5". Disable if PyMuPDF4LLM no longer produces this shape.
     prev = None
     while prev != text:
         prev = text
@@ -358,13 +367,6 @@ def normalize_broken_subsection_numbers(text: str) -> str:
     return text
 
 
-def normalize_inline_subsection_prefixes(text: str) -> str:
-    text = re.sub(r'(?m)^\s*[-•·]\s+(\d+\.\d+(?:\.\d+)*)\s+', r'\1 ', text)
-    text = re.sub(r'(?m)^##\s*(\d+\.\d+(?:\.\d+)*)\s+', r'\1 ', text)
-    text = re.sub(r'(?m)^###\s*(\d+\.\d+(?:\.\d+)*)\s+', r'\1 ', text)
-    return text
-
-
 def normalize_section_sign_headings(text: str) -> str:
     """
     Fix OCR/markdown issues around § headings.
@@ -377,6 +379,8 @@ def normalize_section_sign_headings(text: str) -> str:
     ##§ 8 Foo
     -> ## § 8 Foo
     """
+    # Parser experiment: section-sign repair is highly format-specific. It helps
+    # with glued "§" headings, but may be unnecessary with cleaner parsing.
     # Normalize spacing after ##
     text = re.sub(r'(?im)^##\s*§', '## §', text)
 
@@ -404,18 +408,13 @@ def inject_numbered_item_breaks(text: str) -> str:
     """
     Ensure numbered items start on a new line when OCR glued them inline.
     """
+    # Parser experiment: this can improve child splitting for "(1)" clauses,
+    # but it is a legacy glue repair. Test without it on current PyMuPDF4LLM
+    # output.
     # If a numbered item appears after prose, split it to a new line
     text = re.sub(r'(?<!\n)\s(\((?:\d+)\)\s+)', r'\n\1', text)
 
     return text
-
-
-def promote_top_level_section_headers(text: str) -> str:
-    return re.sub(
-        r'(?m)^(?!(##\s))(\d{1,2}\.\s+(?!\d)[^\n]{1,200})$',
-        r'## \2',
-        text,
-    )
 
 
 def normalize_text(text: str) -> str:
@@ -439,6 +438,7 @@ def normalize_text(text: str) -> str:
     text = normalize_missing_space_after_number_period(text)
 
     text = strip_parser_artifacts(text)
+    text = normalize_markdown_heading_markup(text)
     text = inject_heading_breaks(text)
     text = normalize_section_sign_headings(text)
     text = inject_numbered_item_breaks(text)
@@ -551,6 +551,9 @@ def count_numeric_section_markers(text: str) -> int:
 # ---------- Parser 1: numeric section format ----------
 
 def make_subsection_regex_for_section(section_number: str) -> re.Pattern:
+    # Parser experiment: numeric subsection detection is anchored to the current
+    # parent section, e.g. only "13.x" inside section "13". This avoids many
+    # false positives, but can be skipped if token chunking is enough.
     escaped = re.escape(section_number)
     return re.compile(
         rf'(?:(?<=^)|(?<=\n)|(?<=\n\n))'
@@ -655,6 +658,9 @@ def infer_subsection_title_from_text(
     Examples rejected:
       12.1 MA recognizes that the Technology in source form ...
     """
+    # Parser experiment: title inference is deliberately heuristic. Disable
+    # title extraction first, before disabling subsection splitting, if metadata
+    # titles look noisy.
     text = " ".join(text.split()).strip()
 
     # Remove leading subsection number like 13.5 or 10.2.1
@@ -729,6 +735,9 @@ def split_numeric_section_into_subsections(section: Dict[str, Any]) -> List[Dict
 # ---------- Parser 2: ARTICLE / Section X.Y format ----------
 
 def strip_parent_heading_from_prefix(prefix: str, unit: Dict[str, Any]) -> str:
+    # Parser experiment: removes duplicated parent headings that were injected
+    # for retrieval context before child splits. If heading duplication is gone,
+    # this helper may no longer be needed.
     text = prefix.strip()
 
     candidates = []
@@ -755,6 +764,9 @@ def split_by_marker(
     label_key: str,
     title_key: str,
 ) -> List[Dict[str, Any]]:
+    # Parser experiment: shared splitter for "(a)" and "(i)" markers. It is
+    # intentionally format-specific and may be too granular for cleaner parser
+    # output.
     text = unit["text"]
     matches = list(marker_re.finditer(text))
 
@@ -804,6 +816,9 @@ def clean_subunit_title(title: str, max_words: int = 10) -> str:
 
 
 def split_article_section_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+    # Parser experiment: parser for ARTICLE / Section X.Y contracts. Try
+    # bypassing this branch in build_semantic_units if PyMuPDF4LLM headings are
+    # already sufficient for simple paragraph/token chunking.
     units: List[Dict[str, Any]] = []
 
     current_article_number = None
@@ -908,6 +923,9 @@ def split_article_section_units(pages: List[Tuple[int, str]]) -> List[Dict[str, 
 
 
 def split_article_section_into_subunits(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Parser experiment: splits legal clauses into "(a)" and nested "(i)" units.
+    # This improves focused retrieval on long sections, but can create tiny or
+    # awkward chunks if the source markdown is already well segmented.
     if unit["section_type"] != "body":
         return [dict(unit, subunit_label=None, subunit_title=None, roman_subunit_label=None, roman_subunit_title=None)]
 
@@ -933,45 +951,6 @@ def split_article_section_into_subunits(unit: Dict[str, Any]) -> List[Dict[str, 
     return final_units
 
 
-def split_article_section_into_subunits(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if unit["section_type"] != "body":
-        return [dict(unit, subunit_label=None, subunit_title=None)]
-
-    text = unit["text"]
-    matches = list(LETTER_SUBUNIT_RE.finditer(text))
-
-    if not matches:
-        return [dict(unit, subunit_label=None, subunit_title=None)]
-
-    parts = []
-
-    first_start = matches[0].start()
-    prefix = text[:first_start].strip()
-
-    section_header = f"Section {unit['section_number']} {unit['section_title']}".strip()
-    if prefix and section_header not in prefix:
-        parts.append({
-            **unit,
-            "subunit_label": None,
-            "subunit_title": None,
-            "text": prefix,
-        })
-
-    for i, match in enumerate(matches):
-        start = match.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        block = text[start: end].strip()
-
-        parts.append({
-            **unit,
-            "subunit_label": match.group(1).lower(),
-            "subunit_title": match.group(2).strip(),
-            "text": block,
-        })
-
-    return parts
-
-
 def is_heading_only_unit(unit: Dict[str, Any]) -> bool:
     text = unit["text"].strip()
     if unit.get("roman_section_number") and not unit.get("section_number"):
@@ -981,6 +960,9 @@ def is_heading_only_unit(unit: Dict[str, Any]) -> bool:
 
 
 def split_roman_paragraph_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+    # Parser experiment: parser for Roman numeral / paragraph-sign contracts.
+    # This is one of the more specialized branches and is worth testing without
+    # on the new parser output.
     units: List[Dict[str, Any]] = []
 
     current_roman_number = None
@@ -1086,6 +1068,8 @@ def split_roman_paragraph_units(pages: List[Tuple[int, str]]) -> List[Dict[str, 
 
 
 def split_roman_paragraph_unit_into_subunits(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Parser experiment: splits "§" sections into "(1)", "(2)" children. It may
+    # be unnecessary if PyMuPDF4LLM emits natural paragraph boundaries.
     if unit["section_type"] != "body":
         return [dict(
             unit,
@@ -1135,6 +1119,8 @@ def split_roman_paragraph_unit_into_subunits(unit: Dict[str, Any]) -> List[Dict[
 
 
 def split_roman_children_with_nested_roman(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Parser experiment: currently unused nested "(i)" splitter for Roman-style
+    # sections. Keep only if you decide nested roman metadata is useful.
     numbered_children = split_roman_paragraph_unit_into_subunits(unit)
     final_units: List[Dict[str, Any]] = []
 
@@ -1182,6 +1168,9 @@ def split_paragraph_fallback_units(pages: List[Tuple[int, str]]) -> List[Dict[st
 # ---------- Semantic unit builder ----------
 
 def split_appendix_into_blocks(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Parser experiment: appendix block detection is tuned to CUAD keyword and
+    # trademark appendices. Disable if appendices are rare or paragraph chunks
+    # work well enough.
     if unit["section_type"] != "appendix":
         return [unit]
 
@@ -1262,6 +1251,9 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
 
     semantic_units: List[Dict[str, Any]]
 
+    # Parser experiment: branch selection prefers specialized legal formats
+    # before falling back to paragraphs. To evaluate the new parser, force this
+    # to split_paragraph_fallback_units(pages) and compare retrieval/chunk stats.
     if article_score >= 3:
         top_units = split_article_section_units(pages)
         semantic_units = []
@@ -1295,7 +1287,7 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
 # ---------- Final child-chunk builder ----------
 
 def split_paragraph_by_tokens(paragraph: str, max_tokens: int, overlap_tokens: int) -> List[str]:
-    token_ids = TOKENIZER.encode(paragraph, add_special_tokens=False)
+    token_ids = get_tokenizer().encode(paragraph, add_special_tokens=False)
     if len(token_ids) <= max_tokens:
         return [paragraph.strip()]
 
@@ -1431,22 +1423,13 @@ def load_pdf(
     pdf_path = root_path / Path(relative_path)
     assert pdf_path.exists(), f"File not found: {pdf_path}"
 
-    loader = DoclingLoader(
-        file_path=str(pdf_path),
-        export_type=ExportType.MARKDOWN,
-        md_export_kwargs={
-            "page_break_placeholder": f"\n\n{PAGE_BREAK}\n\n",
-        },
+    markdown_text = pymupdf4llm.to_markdown(
+        doc=str(pdf_path),
+        footer=False,
+        header=True,
+        page_separators=True
     )
 
-    # for doc in loader.load():
-    #     print(doc.page_content)
-
-    raw_docs = loader.load()
-    if not raw_docs:
-        return []
-
-    markdown_text = raw_docs[0].page_content
     semantic_units, base_metadata = build_semantic_units(markdown_text, str(relative_path))
     document_metadata = build_document_metadata(base_metadata, str(relative_path), semantic_units)
 
@@ -1517,3 +1500,30 @@ def load_corpus(
         )
 
     return documents
+
+
+def load_pdf_alternative_method(
+    relative_path: str,
+) -> List[Document]:
+    root_path = Path(__file__).resolve().parents[3]
+    pdf_path = root_path / Path(relative_path)
+    assert pdf_path.exists(), f"File not found: {pdf_path}"
+
+    doc = pymupdf4llm.to_markdown(
+        doc=str(pdf_path),
+        footer=False,
+        header=True,
+        page_separators=True
+    )
+    print(doc)
+
+
+if __name__ == "__main__":
+    relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CreditcardscomInc_20070810_S-1_EX-10.33_362297_EX-10.33_Affiliate Agreement.pdf"
+    # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CybergyHoldingsInc_20140520_10-Q_EX-10.27_8605784_EX-10.27_Affiliate Agreement.pdf"
+    # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/DigitalCinemaDestinationsCorp_20111220_S-1_EX-10.10_7346719_EX-10.10_Affiliate Agreement.pdf"
+    # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/SouthernStarEnergyInc_20051202_SB-2A_EX-9_801890_EX-9_Affiliate Agreement.pdf"
+    # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/SteelVaultCorp_20081224_10-K_EX-10.16_3074935_EX-10.16_Affiliate Agreement.pdf"
+    load_pdf_alternative_method(relative_path)
+
+    # python src/contract_copilot/indexer/ocr_loader.py

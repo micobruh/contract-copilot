@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from functools import lru_cache
+import os
 from pathlib import Path
 
 import yaml
@@ -9,6 +10,8 @@ import yaml
 class AppConfig:
     storing_batch_size: int
     embedding_batch_size: int
+    cpu_num_threads: int
+    cpu_num_interop_threads: int
     rerank_batch_size: int
     collection_name: str
     qdrant_db_link: str
@@ -35,6 +38,23 @@ def load_config(path: Path | None = None) -> AppConfig:
     config_path = path or CONFIG_PATH
     with config_path.open("r", encoding="utf-8") as config_file:
         raw_config = yaml.safe_load(config_file)
+    raw_config["embedding_models_root"] = os.getenv(
+        "EMBEDDING_MODELS_ROOT",
+        raw_config["embedding_models_root"],
+    )
+    raw_config["reranker_models_root"] = os.getenv(
+        "RERANKER_MODELS_ROOT",
+        raw_config["reranker_models_root"],
+    )
+    raw_config["cpu_num_threads"] = int(
+        os.getenv("CPU_NUM_THREADS", raw_config["cpu_num_threads"])
+    )
+    raw_config["cpu_num_interop_threads"] = int(
+        os.getenv(
+            "CPU_NUM_INTEROP_THREADS",
+            raw_config["cpu_num_interop_threads"],
+        )
+    )
     return AppConfig(**raw_config)
 
 
