@@ -10,6 +10,9 @@ import pymupdf4llm
 
 
 PAGE_BREAK = "<<<PAGE_BREAK>>>"
+PYMUPDF_PAGE_END_RE = re.compile(
+    r"(?im)^\s*---\s*end of page\.page_number=(\d+)\s*---\s*$"
+)
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_CORPUS_DIR = Path("data/raw/CUAD_v1/full_contract_pdf")
 
@@ -92,6 +95,38 @@ BAD_SUBSTRINGS = [
 
 # Parser experiment: appendix handling is specific to CUAD exhibits/appendices.
 APPENDIX_HEADING_RE = re.compile(r"(?im)^##\s*Appendix\s*$|^Appendix\s*$")
+APPENDIX_CATEGORY_LABELS = (
+    "Chase Brand",
+    "AARP",
+    "Amazon",
+    "Borders",
+    "Waldenbooks",
+    "British Air",
+    "Continental",
+    "Disney",
+    "Hess",
+    "Holiday Inn/Priority Club",
+    "Marathon",
+    "Marriott",
+    "Overstock",
+    "Sony",
+    "Speedway",
+    "Starbucks",
+    "Subaru",
+    "Toys",
+    "Trump",
+    "United",
+    "Universal",
+    "Volkswagen",
+    "UAL",
+)
+COMMON_TYPO_CORRECTIONS = {
+    "UNIVERSTIY": "UNIVERSITY",
+    "UNVIERSAL": "UNIVERSAL",
+    "UNTIED": "UNITED",
+    "UNTIEDAIR": "UNITEDAIR",
+    "UNITIED": "UNITED",
+}
 # ---------- Company finder ----------
 
 def infer_company_from_filename(file_path: str) -> str | None:
@@ -417,6 +452,46 @@ def inject_numbered_item_breaks(text: str) -> str:
     return text
 
 
+def looks_like_flattened_dash_list_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("- "):
+        return False
+
+    parts = [part.strip() for part in re.split(r"\s+-\s+", stripped[2:]) if part.strip()]
+    if len(parts) < 3:
+        return False
+
+    for part in parts:
+        word_count = count_words(part)
+        if word_count == 0 or word_count > 8:
+            return False
+        if re.search(r"[,;:!?]", part):
+            return False
+
+    return True
+
+
+def normalize_flattened_dash_list_items(text: str) -> str:
+    """
+    Repair parser-flattened catalog/list rows such as:
+      - TERM ONE - TERM TWO - TERM THREE
+    into one bullet per item. The guard is intentionally narrow so normal legal
+    prose bullets that happen to contain dashes are left alone.
+    """
+    normalized_lines = []
+
+    for line in text.splitlines():
+        if not looks_like_flattened_dash_list_line(line):
+            normalized_lines.append(line)
+            continue
+
+        indent = re.match(r"^(\s*)", line).group(1)
+        parts = [part.strip() for part in re.split(r"\s+-\s+", line.strip()[2:]) if part.strip()]
+        normalized_lines.extend(f"{indent}- {part}" for part in parts)
+
+    return "\n".join(normalized_lines)
+
+
 def normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
 
@@ -436,15 +511,21 @@ def normalize_text(text: str) -> str:
         text = text.replace(old, new)
 
     text = normalize_missing_space_after_number_period(text)
+    text = re.sub(r'\(\?([^?\n]{1,80})\?\)', r'("\1")', text)
+    text = re.sub(r'\[([A-Za-z0-9.-]+\.[A-Za-z]{2,})\]', r'\1', text)
+    text = re.sub(r'\bLinkshare NetworkTM\b', 'Linkshare Network™', text)
 
     text = strip_parser_artifacts(text)
     text = normalize_markdown_heading_markup(text)
-    text = inject_heading_breaks(text)
-    text = normalize_section_sign_headings(text)
-    text = inject_numbered_item_breaks(text)
+    text = normalize_flattened_dash_list_items(text)
+    # Parser experiment disabled: old heading/list break repair.
+    # text = inject_heading_breaks(text)
+    # text = normalize_section_sign_headings(text)
+    # text = inject_numbered_item_breaks(text)
 
-    text = normalize_false_markdown_subsection_headers(text)
-    text = normalize_broken_subsection_numbers(text)
+    # Parser experiment disabled: old subsection-number repair.
+    # text = normalize_false_markdown_subsection_headers(text)
+    # text = normalize_broken_subsection_numbers(text)
 
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -457,6 +538,25 @@ def normalize_text(text: str) -> str:
 
 
 def split_pages(markdown_text: str) -> List[Tuple[int, str]]:
+    if PYMUPDF_PAGE_END_RE.search(markdown_text):
+        pages = []
+        current_page_no = 1
+        current_start = 0
+
+        for match in PYMUPDF_PAGE_END_RE.finditer(markdown_text):
+            page = normalize_text(markdown_text[current_start:match.start()])
+            if page.strip():
+                pages.append((current_page_no, page.strip()))
+
+            current_page_no = int(match.group(1)) + 1
+            current_start = match.end()
+
+        page = normalize_text(markdown_text[current_start:])
+        if page.strip():
+            pages.append((current_page_no, page.strip()))
+
+        return pages
+
     pages = markdown_text.split(PAGE_BREAK)
     out = []
     for i, page in enumerate(pages, start=1):
@@ -476,6 +576,29 @@ def detect_metadata_from_pages(pages: List[Tuple[int, str]]) -> Dict[str, Any]:
         meta["document_title"] = m.group(1).strip()
 
     return meta
+
+
+def infer_title_from_front_matter(front_matter_text: str | None) -> str | None:
+    if not front_matter_text:
+        return None
+
+    for line in front_matter_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+
+        title = stripped.lstrip("#").strip()
+        if len(title.split()) <= 12 and any(char.isalpha() for char in title):
+            return title.title()
+
+    for line in front_matter_text.splitlines():
+        title = line.strip().lstrip("#").strip()
+        if not title:
+            continue
+        if len(title.split()) <= 12 and any(char.isalpha() for char in title):
+            return title.title()
+
+    return None
 
 
 def extract_path_metadata(source_file: str) -> Dict[str, Any]:
@@ -510,22 +633,30 @@ def build_document_metadata(
 ) -> Dict[str, Any]:
     source_metadata = extract_path_metadata(source_file)
 
-    first_text = next(
-        (
-            unit["text"][:2000]
-            for unit in semantic_units
-            if unit.get("section_type") in {"front_matter", "body"} and unit.get("text", "").strip()
-        ),
-        "",
-    )
-
-    companies = dedupe_companies(extract_all_companies_from_intro(first_text))
+    # Parser experiment disabled: intro/company regex extraction is tuned to
+    # older noisy parser output. Re-enable this block if filename metadata is
+    # not enough.
+    # first_text = next(
+    #     (
+    #         unit["text"][:2000]
+    #         for unit in semantic_units
+    #         if unit.get("section_type") in {"front_matter", "body"} and unit.get("text", "").strip()
+    #     ),
+    #     "",
+    # )
+    # companies = dedupe_companies(extract_all_companies_from_intro(first_text))
+    companies = []
     if not companies:
         inferred_company = infer_company_from_filename(source_file)
         if inferred_company:
             companies = [inferred_company]
 
-    document_title = base_metadata.get("document_title") or prettify_title(source_metadata["document_id"])
+    front_matter_title = infer_title_from_front_matter(base_metadata.get("front_matter_text"))
+    document_title = (
+        base_metadata.get("document_title")
+        or front_matter_title
+        or prettify_title(source_metadata["document_id"])
+    )
 
     return {
         **base_metadata,
@@ -535,6 +666,8 @@ def build_document_metadata(
         "company_names": companies,
         "all_companies": companies,
         "party_count": len(companies),
+        "front_matter_text": base_metadata.get("front_matter_text"),
+        "front_matter_pages": base_metadata.get("front_matter_pages"),
     }
 
 
@@ -1149,20 +1282,624 @@ def split_roman_children_with_nested_roman(unit: Dict[str, Any]) -> List[Dict[st
 
 # ---------- Parser 3: paragraph fallback ----------
 
-def split_paragraph_fallback_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
-    text = "\n\n".join(page for _, page in pages)
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+def looks_like_list_item_block(text: str) -> bool:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return bool(re.match(
+        r"^(?:[-+*]\s+|\d+[.)]\s+|\([A-Za-z0-9ivxlcdmIVXLCDM]+\)\s+)",
+        first_line,
+    ))
 
+
+def looks_like_heading_block(text: str) -> bool:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return bool(
+        first_line.startswith("#")
+        or re.match(r"^(?:ARTICLE\s+[IVXLC]+|Section\s+\d+(?:\.\d+)*|§\s*\d+)", first_line, re.IGNORECASE)
+        or re.match(r"^\d{1,2}\.\s+\D", first_line)
+    )
+
+
+def looks_like_section_heading_only(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return False
+
+    line = lines[0]
+    return bool(
+        re.match(r"^#{1,6}\s*\d{1,2}\.\s*\D", line)
+        or re.match(r"^\d{1,2}\.\s+\D", line)
+        or re.match(r"^(?:#{1,6}\s*)?Section\s+\d+(?:\.\d+)*\b", line, re.IGNORECASE)
+        or re.match(r"^(?:#{1,6}\s*)?§\s*\d+", line)
+    )
+
+
+def promote_semantic_heading_markup(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("#"):
+        return stripped
+
+    return f"## {stripped}"
+
+
+def should_merge_page_continuation(previous_text: str, next_text: str) -> bool:
+    if not previous_text.strip() or not next_text.strip():
+        return False
+
+    if looks_like_heading_block(next_text) or looks_like_list_item_block(next_text):
+        return False
+
+    previous_tail = previous_text.rstrip()
+    if previous_tail.endswith((".", ":", ";", "?", "!", '"', "'")):
+        return False
+
+    next_start = next_text.lstrip()
+    return bool(
+        next_start
+        and (
+            next_start[0].islower()
+            or next_start[0] in ",.;:)]}"
+            or looks_like_orphan_sentence_tail(next_text)
+        )
+    )
+
+
+def looks_like_continuation_block(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if looks_like_heading_block(stripped) or looks_like_list_item_block(stripped):
+        return False
+
+    return bool(
+        re.match(r"^(?:https?://|www\.)", stripped, re.IGNORECASE)
+        or re.match(r"^For\s+(?:new|existing)\s+affiliates?\s*:", stripped, re.IGNORECASE)
+    )
+
+
+def looks_like_orphan_sentence_tail(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if looks_like_heading_block(stripped) or looks_like_list_item_block(stripped):
+        return False
+
+    return count_words(stripped) <= 2 and stripped.endswith((".", ",", ";", ":", ")", "]"))
+
+
+def looks_like_short_tail_block(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if looks_like_heading_block(stripped) or looks_like_list_item_block(stripped):
+        return False
+
+    return count_words(stripped) <= 2 and stripped.endswith((".", ",", ";", ":", ")", "]"))
+
+
+def looks_like_form_control_block(text: str) -> bool:
+    return text.strip().lower().strip(".:") in {"accept", "agree", "submit", "cancel"}
+
+
+def append_to_semantic_unit(unit: Dict[str, Any], text: str, page_no: int, separator: str = "\n\n") -> None:
+    unit["text"] = f"{unit['text'].rstrip()}{separator}{text.strip()}"
+    unit["page_numbers"] = sorted(set([*unit.get("page_numbers", []), page_no]))
+
+
+def split_paragraphs_with_list_items(text: str) -> List[str]:
+    paragraphs: List[str] = []
+
+    for para in (p.strip() for p in text.split("\n\n") if p.strip()):
+        if paragraphs and looks_like_list_item_block(para):
+            paragraphs[-1] = f"{paragraphs[-1].rstrip()}\n\n{para}"
+        else:
+            paragraphs.append(para)
+
+    return paragraphs
+
+
+def split_paragraph_fallback_units(pages: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
     units = []
-    for i, para in enumerate(paragraphs, start=1):
-        units.append({
-            "section_type": "body",
-            "section_number": None,
-            "section_title": f"Paragraph {i}",
-            "text": para,
-            "page_numbers": [],
-        })
+    paragraph_index = 1
+
+    for page_no, page_text in pages:
+        paragraphs = [p.strip() for p in page_text.split("\n\n") if p.strip()]
+
+        for para in paragraphs:
+            if looks_like_form_control_block(para):
+                continue
+
+            if looks_like_heading_block(para):
+                units.append({
+                    "section_type": "body",
+                    "section_number": None,
+                    "section_title": f"Paragraph {paragraph_index}",
+                    "text": promote_semantic_heading_markup(para),
+                    "page_numbers": [page_no],
+                })
+                paragraph_index += 1
+                continue
+
+            if units and looks_like_list_item_block(para):
+                append_to_semantic_unit(units[-1], para, page_no)
+                continue
+
+            if units and looks_like_continuation_block(para):
+                append_to_semantic_unit(units[-1], para, page_no)
+                continue
+
+            if units and looks_like_short_tail_block(para):
+                append_to_semantic_unit(units[-1], para, page_no, separator=" ")
+                continue
+
+            if units and looks_like_section_heading_only(units[-1]["text"]):
+                append_to_semantic_unit(units[-1], para, page_no)
+                continue
+
+            if (
+                units
+                and should_merge_page_continuation(units[-1]["text"], para)
+            ):
+                append_to_semantic_unit(units[-1], para, page_no, separator=" ")
+                continue
+
+            units.append({
+                "section_type": "body",
+                "section_number": None,
+                "section_title": f"Paragraph {paragraph_index}",
+                "text": para,
+                "page_numbers": [page_no],
+            })
+            paragraph_index += 1
+
     return units
+
+
+def is_numbered_section_heading_text(text: str) -> bool:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return bool(re.match(r"^#{1,6}\s*\d{1,2}\.\s+\D", first_line))
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text))
+
+
+def looks_like_front_matter_unit(text: str, max_words: int) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if is_numbered_section_heading_text(stripped):
+        return False
+
+    if stripped.startswith("#"):
+        return count_words(stripped) <= max_words
+
+    if count_words(stripped) > max_words:
+        return False
+
+    if re.search(r"\b(?:agreement|party|affiliate|shall|will|must|may)\b", stripped, re.IGNORECASE):
+        return False
+
+    return True
+
+
+def compact_front_matter_units(
+    semantic_units: List[Dict[str, Any]],
+    max_units: int = 6,
+    max_words: int = 16,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    front_units = []
+    body_start_index = 0
+
+    for index, unit in enumerate(semantic_units[:max_units]):
+        text = unit.get("text", "").strip()
+        if not text:
+            body_start_index = index + 1
+            continue
+
+        if not looks_like_front_matter_unit(text, max_words):
+            body_start_index = index
+            break
+
+        front_units.append(unit)
+        body_start_index = index + 1
+
+    if not front_units:
+        return semantic_units, {}
+
+    front_text = "\n\n".join(unit["text"].strip() for unit in front_units if unit.get("text", "").strip())
+    front_pages = sorted({
+        page
+        for unit in front_units
+        for page in unit.get("page_numbers", [])
+    })
+
+    metadata = {
+        "front_matter_text": front_text,
+        "front_matter_pages": front_pages,
+    }
+
+    return semantic_units[body_start_index:], metadata
+
+
+def merge_preamble_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    preamble_units = []
+    body_start_index = 0
+
+    for index, unit in enumerate(semantic_units):
+        text = unit.get("text", "").strip()
+
+        if is_numbered_section_heading_text(text):
+            body_start_index = index
+            break
+
+        preamble_units.append(unit)
+        body_start_index = index + 1
+
+    if len(preamble_units) <= 1:
+        return semantic_units
+
+    merged = {
+        **preamble_units[0],
+        "section_title": "Preamble",
+        "text": "\n\n".join(
+            unit["text"].strip()
+            for unit in preamble_units
+            if unit.get("text", "").strip()
+        ),
+        "page_numbers": sorted({
+            page
+            for unit in preamble_units
+            for page in unit.get("page_numbers", [])
+        }),
+    }
+
+    return [merged, *semantic_units[body_start_index:]]
+
+
+def starts_with_numbered_section_heading(text: str) -> bool:
+    return is_numbered_section_heading_text(text)
+
+
+def merge_section_continuation_units(
+    semantic_units: List[Dict[str, Any]],
+    max_continuation_words: int = 220,
+) -> List[Dict[str, Any]]:
+    merged_units: List[Dict[str, Any]] = []
+
+    for unit in semantic_units:
+        text = unit.get("text", "").strip()
+
+        if not merged_units:
+            merged_units.append(unit)
+            continue
+
+        if unit.get("section_type") != "body":
+            merged_units.append(unit)
+            continue
+
+        previous = merged_units[-1]
+        if (
+            previous.get("section_type") == "body"
+            and starts_with_numbered_section_heading(previous.get("text", ""))
+            and not looks_like_heading_block(text)
+            and (
+                count_words(text) <= max_continuation_words
+                or unit.get("contains_list_continuation")
+            )
+        ):
+            previous["text"] = f"{previous['text'].rstrip()}\n\n{text}"
+            previous["page_numbers"] = sorted(set([
+                *previous.get("page_numbers", []),
+                *unit.get("page_numbers", []),
+            ]))
+            if unit.get("contains_list_continuation"):
+                previous["contains_list_continuation"] = True
+            continue
+
+        merged_units.append(unit)
+
+    return merged_units
+
+
+LIST_CONTINUATION_CATALOG_RE = re.compile(
+    r"(?is)(.*?\b(?:following|listed below)\s+(?:words|terms|items|phrases|keywords|names):\s*)"
+    r"(\n\n-\s+.+)$"
+)
+def split_catalog_from_trailing_legal_bullets(catalog_text: str) -> Tuple[str, str | None]:
+    bullet_blocks = re.split(r"(?=\n\n-\s+)", catalog_text)
+    catalog_blocks = []
+    trailing_blocks = []
+    in_trailing_legal = False
+
+    for block in bullet_blocks:
+        stripped = block.strip()
+        if not stripped:
+            continue
+
+        bullet_body = re.sub(r"^-\s+", "", stripped).strip()
+        if re.match(
+            r"^(?:Uses|Otherwise|Does|Is|Contains|Promotes|Engages|Misrepresents|Manipulates)\b",
+            bullet_body,
+            re.IGNORECASE,
+        ):
+            in_trailing_legal = True
+
+        if in_trailing_legal:
+            trailing_blocks.append(stripped)
+        else:
+            catalog_blocks.append(stripped)
+
+    catalog = "\n\n".join(catalog_blocks).strip()
+    trailing = "\n\n".join(trailing_blocks).strip()
+    return catalog, trailing or None
+
+
+def merge_list_continuation_catalog_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    for unit in semantic_units:
+        text = unit.get("text", "")
+        match = LIST_CONTINUATION_CATALOG_RE.match(text)
+
+        if not match:
+            out.append(unit)
+            continue
+
+        lead_text = match.group(1).strip()
+        catalog_text, trailing_legal_text = split_catalog_from_trailing_legal_bullets(match.group(2).strip())
+
+        if count_words(catalog_text) < 40:
+            out.append(unit)
+            continue
+
+        out.append({
+            **unit,
+            "contains_list_continuation": True,
+            "text": "\n\n".join(
+                part
+                for part in [lead_text, catalog_text, trailing_legal_text]
+                if part
+            ),
+        })
+
+    return out
+
+
+def split_list_continuation_catalog_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return merge_list_continuation_catalog_units(semantic_units)
+
+
+def split_restricted_keyword_catalog_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return merge_list_continuation_catalog_units(semantic_units)
+
+
+def looks_like_appendix_start(text: str) -> bool:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return bool(re.match(r"^#{1,6}\s*Appendix\b|^Appendix\b", first_line, re.IGNORECASE))
+
+
+def looks_like_appendix_subheading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    first_line = next((line.strip() for line in stripped.splitlines() if line.strip()), "")
+    if looks_like_appendix_start(first_line):
+        return True
+
+    if first_line.startswith("#"):
+        return True
+
+    if re.search(r"\b(?:Restricted|Trademark|Key Words|Terms)\b", first_line, re.IGNORECASE):
+        return count_words(first_line) <= 8
+
+    return False
+
+
+def merge_appendix_units_by_heading(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    appendix_start = next(
+        (
+            index
+            for index, unit in enumerate(semantic_units)
+            if looks_like_appendix_start(unit.get("text", ""))
+        ),
+        None,
+    )
+
+    if appendix_start is None:
+        return semantic_units
+
+    prefix_units = semantic_units[:appendix_start]
+    appendix_units = semantic_units[appendix_start:]
+    grouped_appendix_units: List[Dict[str, Any]] = []
+    header_parts = []
+    header_pages = []
+
+    for unit in appendix_units:
+        text = unit.get("text", "").strip()
+        if not text:
+            continue
+
+        if looks_like_appendix_subheading(text):
+            header_parts.append(text)
+            header_pages.extend(unit.get("page_numbers", []))
+            continue
+
+        full_text = "\n\n".join([*header_parts, text]).strip()
+        first_line = next((line.strip().lstrip("#").strip() for line in text.splitlines() if line.strip()), "Appendix")
+        grouped_appendix_units.append({
+            **unit,
+            "section_type": "appendix",
+            "section_title": clean_heading_title(first_line, max_words=8) or "Appendix",
+            "text": full_text,
+            "page_numbers": sorted(set([
+                *header_pages,
+                *unit.get("page_numbers", []),
+            ])),
+        })
+        header_parts = []
+        header_pages = []
+
+    if header_parts:
+        grouped_appendix_units.append({
+            **appendix_units[-1],
+            "section_type": "appendix",
+            "section_title": "Appendix",
+            "text": "\n\n".join(header_parts).strip(),
+            "page_numbers": sorted(set(header_pages)),
+        })
+
+    return [*prefix_units, *grouped_appendix_units]
+
+
+def appendix_category_pattern() -> re.Pattern:
+    labels = sorted(APPENDIX_CATEGORY_LABELS, key=len, reverse=True)
+    escaped = [re.escape(label) for label in labels]
+    return re.compile(rf"(?<![A-Za-z0-9/&])({'|'.join(escaped)})(?=\s)")
+
+
+def split_appendix_category_text(text: str) -> List[Tuple[str, str]]:
+    header_lines = []
+    body_lines = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not body_lines and (
+            not stripped
+            or stripped.startswith("#")
+            or re.search(r"\b(?:Restricted Trademark Terms|Partner Restricted Trademark Terms)\b", stripped, re.IGNORECASE)
+        ):
+            if stripped:
+                header_lines.append(stripped)
+            continue
+        body_lines.append(line)
+
+    body = "\n".join(body_lines).strip()
+    if not body:
+        return [("Appendix", text.strip())] if text.strip() else []
+
+    matches = []
+    previous_label = None
+    for match in appendix_category_pattern().finditer(body):
+        label = match.group(1)
+        if label == previous_label:
+            continue
+        matches.append(match)
+        previous_label = label
+    if not matches:
+        title = clean_heading_title(body.splitlines()[0].strip(), max_words=8)
+        return [(title or "Appendix", text.strip())]
+
+    chunks: List[Tuple[str, str]] = []
+    header = "\n\n".join(header_lines).strip()
+
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        chunk_body = body[start:end].strip(" ,\n")
+        if not chunk_body:
+            continue
+
+        title = match.group(1)
+        chunk_text = "\n\n".join(part for part in [header, chunk_body] if part)
+        chunks.append((f"Appendix - {title}", chunk_text))
+
+    return chunks or [("Appendix", text.strip())]
+
+
+def split_appendix_units_by_category(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    for unit in semantic_units:
+        if unit.get("section_type") != "appendix":
+            out.append(unit)
+            continue
+
+        chunks = split_appendix_category_text(unit.get("text", ""))
+        if len(chunks) <= 1:
+            title, text = chunks[0] if chunks else (unit.get("section_title", "Appendix"), unit.get("text", ""))
+            out.append({
+                **unit,
+                "section_title": title or unit.get("section_title", "Appendix"),
+                "text": text,
+            })
+            continue
+
+        for title, text in chunks:
+            out.append({
+                **unit,
+                "section_title": title,
+                "text": text,
+            })
+
+    return out
+
+
+def appendix_category_key(unit: Dict[str, Any]) -> str | None:
+    if unit.get("section_type") != "appendix":
+        return None
+
+    title = unit.get("section_title", "")
+    title = re.sub(r"^Appendix\s*-\s*", "", title, flags=re.IGNORECASE).strip()
+
+    if title.upper() == "UAL":
+        return "United"
+
+    if title.lower().startswith("in addition"):
+        return "Chase Brand"
+
+    return title or None
+
+
+def looks_like_appendix_cross_reference(unit: Dict[str, Any]) -> bool:
+    if unit.get("section_type") != "appendix":
+        return False
+
+    text = " ".join(unit.get("text", "").split()).strip(" .")
+    if count_words(text) > 6:
+        return False
+
+    return bool(
+        re.fullmatch(
+            r"[A-Z][A-Za-z/& ]{1,40}\s+See\s+[\"']?[A-Z][A-Za-z/& ]{1,40}[\"']?\s+Tab",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def merge_related_appendix_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    appendix_key_to_index: Dict[str, int] = {}
+
+    for unit in semantic_units:
+        if looks_like_appendix_cross_reference(unit):
+            continue
+
+        key = appendix_category_key(unit)
+
+        if not out or key is None:
+            out.append(unit)
+            continue
+
+        if key in appendix_key_to_index:
+            existing = out[appendix_key_to_index[key]]
+            existing["text"] = f"{existing['text'].rstrip()}\n\n{unit['text'].strip()}"
+            existing["page_numbers"] = sorted(set([
+                *existing.get("page_numbers", []),
+                *unit.get("page_numbers", []),
+            ]))
+            existing["section_title"] = f"Appendix - {key}"
+            continue
+
+        appendix_key_to_index[key] = len(out)
+        out.append(unit)
+
+    return out
 
 
 # ---------- Semantic unit builder ----------
@@ -1240,40 +1977,105 @@ def count_roman_paragraph_markers(text: str) -> int:
     return len(ROMAN_SECTION_RE.findall(text)) + len(PARAGRAPH_SECTION_RE.findall(text))
 
 
+def build_text_with_sic_annotations(text: str, typo_matches: List[Dict[str, Any]]) -> str:
+    if not typo_matches:
+        return text
+
+    annotated_parts = []
+    cursor = 0
+
+    for typo in sorted(typo_matches, key=lambda item: item["start"]):
+        start = typo["start"]
+        end = typo["end"]
+        if start < cursor:
+            continue
+
+        annotated_parts.append(text[cursor:end])
+        annotated_parts.append(" [sic]")
+        cursor = end
+
+    annotated_parts.append(text[cursor:])
+    return "".join(annotated_parts)
+
+
+def annotate_suspected_typos(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    typo_pattern = re.compile(
+        r"\b(" + "|".join(re.escape(word) for word in COMMON_TYPO_CORRECTIONS) + r")\b",
+        re.IGNORECASE,
+    )
+
+    for unit in semantic_units:
+        text = unit.get("text", "")
+        suspected_typos = []
+
+        for match in typo_pattern.finditer(text):
+            original = match.group(0)
+            suggestion = COMMON_TYPO_CORRECTIONS[original.upper()]
+            if original.islower():
+                suggestion = suggestion.lower()
+            elif original.istitle():
+                suggestion = suggestion.title()
+
+            suspected_typos.append({
+                "text": original,
+                "suggestion": suggestion,
+                "start": match.start(),
+                "end": match.end(),
+                "annotation": f"{original} [sic]",
+            })
+
+        if suspected_typos:
+            unit["suspected_typos"] = suspected_typos
+            unit["text_with_sic_annotations"] = build_text_with_sic_annotations(text, suspected_typos)
+
+    return semantic_units
+
+
 def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     pages = split_pages(markdown_text)
     base_metadata = detect_metadata_from_pages(pages)
-    full_text = "\n\n".join(page for _, page in pages)
-
-    article_score = count_article_section_markers(full_text)
-    numeric_score = count_numeric_section_markers(full_text)
-    roman_score = count_roman_paragraph_markers(full_text)
 
     semantic_units: List[Dict[str, Any]]
 
-    # Parser experiment: branch selection prefers specialized legal formats
-    # before falling back to paragraphs. To evaluate the new parser, force this
-    # to split_paragraph_fallback_units(pages) and compare retrieval/chunk stats.
-    if article_score >= 3:
-        top_units = split_article_section_units(pages)
-        semantic_units = []
-        for unit in top_units:
-            semantic_units.extend(split_article_section_into_subunits(unit))
-    elif roman_score >= 2:
-        top_units = split_roman_paragraph_units(pages)
-        semantic_units = []
-        for unit in top_units:
-            semantic_units.extend(split_roman_paragraph_unit_into_subunits(unit))       
-    elif numeric_score >= 2:
-        top_units = split_numeric_top_sections(pages)
-        semantic_units = []
-        for unit in top_units:
-            if unit["section_type"] == "appendix":
-                semantic_units.extend(split_appendix_into_blocks(unit))
-            else:
-                semantic_units.extend(split_numeric_section_into_subsections(unit))
-    else:
-        semantic_units = split_paragraph_fallback_units(pages)
+    # Parser experiment disabled: specialized legal-format parsers are bypassed
+    # so the current PyMuPDF4LLM output is chunked by natural paragraphs/tokens.
+    # Re-enable this branch if paragraph chunks lose useful legal structure.
+    #
+    # full_text = "\n\n".join(page for _, page in pages)
+    # article_score = count_article_section_markers(full_text)
+    # numeric_score = count_numeric_section_markers(full_text)
+    # roman_score = count_roman_paragraph_markers(full_text)
+    #
+    # if article_score >= 3:
+    #     top_units = split_article_section_units(pages)
+    #     semantic_units = []
+    #     for unit in top_units:
+    #         semantic_units.extend(split_article_section_into_subunits(unit))
+    # elif roman_score >= 2:
+    #     top_units = split_roman_paragraph_units(pages)
+    #     semantic_units = []
+    #     for unit in top_units:
+    #         semantic_units.extend(split_roman_paragraph_unit_into_subunits(unit))
+    # elif numeric_score >= 2:
+    #     top_units = split_numeric_top_sections(pages)
+    #     semantic_units = []
+    #     for unit in top_units:
+    #         if unit["section_type"] == "appendix":
+    #             semantic_units.extend(split_appendix_into_blocks(unit))
+    #         else:
+    #             semantic_units.extend(split_numeric_section_into_subsections(unit))
+    # else:
+    #     semantic_units = split_paragraph_fallback_units(pages)
+    semantic_units = split_paragraph_fallback_units(pages)
+    semantic_units, front_matter_metadata = compact_front_matter_units(semantic_units)
+    semantic_units = merge_preamble_units(semantic_units)
+    semantic_units = merge_section_continuation_units(semantic_units)
+    semantic_units = split_restricted_keyword_catalog_units(semantic_units)
+    semantic_units = merge_section_continuation_units(semantic_units)
+    semantic_units = merge_appendix_units_by_heading(semantic_units)
+    semantic_units = split_appendix_units_by_category(semantic_units)
+    semantic_units = merge_related_appendix_units(semantic_units)
+    semantic_units = annotate_suspected_typos(semantic_units)
 
     for i, unit in enumerate(semantic_units, start=1):
         stem = Path(source_file).stem
@@ -1281,7 +2083,7 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
         unit["source"] = source_file
         unit["semantic_unit_token_count"] = count_tokens(unit["text"])
 
-    return semantic_units, base_metadata
+    return semantic_units, {**base_metadata, **front_matter_metadata}
 
 
 # ---------- Final child-chunk builder ----------
@@ -1309,7 +2111,7 @@ def split_semantic_unit_to_child_chunks(text: str, max_tokens: int = 256, overla
     if count_tokens(text) <= max_tokens:
         return [text]
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs = split_paragraphs_with_list_items(text)
     if not paragraphs:
         return split_paragraph_by_tokens(text, max_tokens, overlap_tokens)
 
@@ -1383,19 +2185,28 @@ def build_final_documents(
                     "company_names": base_metadata.get("company_names"),
                     "all_companies": base_metadata.get("all_companies"),
                     "party_count": base_metadata.get("party_count"),
+                    "front_matter_text": base_metadata.get("front_matter_text"),
+                    "front_matter_pages": base_metadata.get("front_matter_pages"),
                     "section_type": unit.get("section_type"),
-                    "article_number": unit.get("article_number"),
-                    "article_title": unit.get("article_title"),
-                    "section_number": unit.get("section_number"),
-                    "section_title": unit.get("section_title"),
-                    "roman_section_number": unit.get("roman_section_number"),
-                    "roman_section_title": unit.get("roman_section_title"),
-                    "subsection_number": unit.get("subsection_number"),
-                    "subsection_title": unit.get("subsection_title"),
-                    "subunit_label": unit.get("subunit_label"),
-                    "subunit_title": unit.get("subunit_title"),
-                    "roman_subunit_label": unit.get("roman_subunit_label"),
-                    "roman_subunit_title": unit.get("roman_subunit_title"),
+                    "contains_list_continuation": unit.get("contains_list_continuation"),
+                    "continues_section": unit.get("continues_section"),
+                    "continuation_label": unit.get("continuation_label"),
+                    "suspected_typos": unit.get("suspected_typos"),
+                    "text_with_sic_annotations": unit.get("text_with_sic_annotations"),
+                    # Parser experiment disabled: these fields are only useful
+                    # when specialized legal-section parsers are active.
+                    # "article_number": unit.get("article_number"),
+                    # "article_title": unit.get("article_title"),
+                    # "section_number": unit.get("section_number"),
+                    # "section_title": unit.get("section_title"),
+                    # "roman_section_number": unit.get("roman_section_number"),
+                    # "roman_section_title": unit.get("roman_section_title"),
+                    # "subsection_number": unit.get("subsection_number"),
+                    # "subsection_title": unit.get("subsection_title"),
+                    # "subunit_label": unit.get("subunit_label"),
+                    # "subunit_title": unit.get("subunit_title"),
+                    # "roman_subunit_label": unit.get("roman_subunit_label"),
+                    # "roman_subunit_title": unit.get("roman_subunit_title"),
                     "page_numbers": page_numbers,
                     "page_start": page_numbers[0] if page_numbers else None,
                     "page_end": page_numbers[-1] if page_numbers else None,
@@ -1445,17 +2256,21 @@ def load_pdf(
         for i, unit in enumerate(semantic_units, start=1):
             print("-" * 80)
             print(f"Unit {i}")
-            print(f"Document Title: {document_metadata.get('document_title')}")
-            print(f"Company Names: {document_metadata.get('company_names')}")
-            print(f"Party Count: {document_metadata.get('party_count')}")
-            print(f"Source: {unit['source']}")
-            print(f"Semantic Unit ID: {unit['semantic_unit_id']}")
-            print(f"Article: {unit.get('article_number')} - {unit.get('article_title')}")
-            print(f"Section: {unit.get('section_number')} - {unit.get('section_title')}")
-            print(f"Roman Section: {unit.get('roman_section_number')} - {unit.get('roman_section_title')}")
-            print(f"Subsection: {unit.get('subsection_number')} - {unit.get('subsection_title')}")
-            print(f"Roman Subunit: {unit.get('roman_subunit_label')} - {unit.get('roman_subunit_title')}")
-            print(f"Subunit: {unit.get('subunit_label')} - {unit.get('subunit_title')}")
+            # print(f"Document Title: {document_metadata.get('document_title')}")
+            # print(f"Company Names: {document_metadata.get('company_names')}")
+            # print(f"Party Count: {document_metadata.get('party_count')}")
+            # print(f"Source: {unit['source']}")
+            # print(f"Semantic Unit ID: {unit['semantic_unit_id']}")
+            # print(f"Section Type: {unit.get('section_type')}")
+            print(f"Page Numbers: {unit.get('page_numbers')}")
+            # Parser experiment disabled: specialized parser metadata is not
+            # populated in paragraph-fallback mode.
+            # print(f"Article: {unit.get('article_number')} - {unit.get('article_title')}")
+            # print(f"Section: {unit.get('section_number')} - {unit.get('section_title')}")
+            # print(f"Roman Section: {unit.get('roman_section_number')} - {unit.get('roman_section_title')}")
+            # print(f"Subsection: {unit.get('subsection_number')} - {unit.get('subsection_title')}")
+            # print(f"Roman Subunit: {unit.get('roman_subunit_label')} - {unit.get('roman_subunit_title')}")
+            # print(f"Subunit: {unit.get('subunit_label')} - {unit.get('subunit_title')}")
             print(f"Token Count: {unit['semantic_unit_token_count']}")
             print(unit["text"])
 
@@ -1524,6 +2339,6 @@ if __name__ == "__main__":
     # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/DigitalCinemaDestinationsCorp_20111220_S-1_EX-10.10_7346719_EX-10.10_Affiliate Agreement.pdf"
     # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/SouthernStarEnergyInc_20051202_SB-2A_EX-9_801890_EX-9_Affiliate Agreement.pdf"
     # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/SteelVaultCorp_20081224_10-K_EX-10.16_3074935_EX-10.16_Affiliate Agreement.pdf"
-    load_pdf_alternative_method(relative_path)
+    load_pdf(relative_path, debug=True)
 
     # python src/contract_copilot/indexer/ocr_loader.py

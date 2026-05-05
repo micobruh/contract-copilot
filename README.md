@@ -3,6 +3,19 @@
 Another data source: https://huggingface.co/datasets/isaacus/legal-rag-bench
 environment name: torch201
 
+Potential unit type to add: 
+
+unit_type ∈ {
+  preamble,
+  clause,
+  subclause,
+  list_item_group,
+  appendix_heading,
+  appendix_table_row,
+  signature_or_acceptance,
+  artifact
+}
+
 ## Docker
 
 Build and run the Streamlit app with Docker:
