@@ -28,9 +28,12 @@ TOP_SECTION_RE = re.compile(
 
 # Parser experiment: detects "ARTICLE I" + "Section 1.1 Title" contracts.
 # This is format-specific legal-structure logic, not generic cleanup.
-ARTICLE_RE = re.compile(r"(?m)^(?:##\s*)?ARTICLE\s+([IVXLC]+)\s*$", re.IGNORECASE)
+ARTICLE_RE = re.compile(
+    r"(?m)^(?:##\s*)?ARTICLE\s+([IVXLC]+)(?:\s+(.{1,140}?))?\s*$",
+    re.IGNORECASE,
+)
 SECTION_XY_RE = re.compile(
-    r"(?im)^(?:##\s*)?Section\s+(\d+\.\d+)\s+(.{1,140}?)(?:\.\s*$|\s*$)"
+    r"(?im)^(?:##\s*)?Section\s+(\d+\.\d+)\s+(.+)$"
 )
 
 # Parser experiment: detects German/European-style structures such as
@@ -58,6 +61,12 @@ ROMAN_SUBUNIT_RE = re.compile(
 NUMBERED_ITEM_START_RE = re.compile(
     r"(?im)^\((\d+)\)\s+(.{1,120}?)(?=\.\s|:\s|$)"
 )
+SUBSECTION_MARKER_LINE_RE = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<marker>[-+*])\s+)?"
+    r"(?P<label>(?P<parent>\d{1,2}|[A-Z])\.\d+(?:\.\d+)*)\b"
+    r"(?P<rest>.*)$"
+)
+LETTER_LIST_ITEM_RE = re.compile(r"\(([a-z])\)\s+", re.IGNORECASE)
 
 ENTITY_SUFFIXES = (
     r'Inc\.?|LLC|L\.L\.C\.|Corp\.?|Corporation|Company|Ltd\.?|Limited|'
@@ -95,6 +104,15 @@ BAD_SUBSTRINGS = [
 
 # Parser experiment: appendix handling is specific to CUAD exhibits/appendices.
 APPENDIX_HEADING_RE = re.compile(r"(?im)^##\s*Appendix\s*$|^Appendix\s*$")
+ATTACHMENT_PREFACE_HEADING_RE = re.compile(
+    r"^#{1,6}\s*(?:Schedule|Exhibit|Annex|Attachment|Addendum)\s+[A-Z0-9]+[A-Z0-9.-]*\s*$",
+    re.IGNORECASE,
+)
+ATTACHMENT_START_RE = re.compile(
+    r"^(?:#{1,6}\s*)?(?P<kind>Appendix|Schedule|Exhibit|Annex|Attachment|Addendum)"
+    r"\s+(?P<label>[A-Z0-9]+[A-Z0-9.-]*)\b",
+    re.IGNORECASE,
+)
 APPENDIX_CATEGORY_LABELS = (
     "Chase Brand",
     "AARP",
@@ -254,6 +272,63 @@ def normalize_markdown_heading_markup(text: str) -> str:
         )
         normalized_lines.append(line)
     return "\n".join(normalized_lines)
+
+
+def normalize_inline_markdown_emphasis(text: str) -> str:
+    """
+    Remove inline Markdown emphasis markers emitted by the parser while keeping
+    the emphasized content.
+    """
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"(?<!\*)\*\*([^\n*]+?)\*\*(?!\*)", r"\1", text)
+        text = re.sub(r"(?<!_)__([^\n_]+?)__(?!_)", r"\1", text)
+
+    return text
+
+
+def normalize_quoted_text_spacing(text: str) -> str:
+    return re.sub(r'"[ \t]+([^"\n]{1,120}?\S)[ \t]+"', r'"\1"', text)
+
+
+def normalize_missing_punctuation_spacing(text: str) -> str:
+    """
+    Repair parser-glued punctuation without touching common numeric/legal
+    patterns such as 19.3, 1,000, or U.S.
+    """
+    text = re.sub(r'([,;:])(?=(?:"|[A-Za-z]))', r'\1 ', text)
+    text = re.sub(r'(?<=[a-z0-9)\]"])\.(?=(?:"[A-Z])|[A-Z])', r'. ', text)
+    text = re.sub(r'(?<=[A-Za-z0-9.!?])"(?=[A-Za-z])', r'" ', text)
+    return text
+
+
+def normalize_quoted_section_headings(text: str) -> str:
+    """
+    PyMuPDF sometimes emits section headings with a stray leading quote instead
+    of Markdown heading markup, e.g. "' Section 13.1 Confidential Treatment."
+    """
+    return re.sub(
+        r"(?im)^\s*['\"]\s*(Section\s+\d+(?:\.\d+)*\b)",
+        r"## \1",
+        text,
+    )
+
+
+def normalize_heading_paragraph_breaks(text: str) -> str:
+    heading_start = (
+        r"(?:#{1,6}\s*)?"
+        r"(?:ARTICLE\s+[IVXLC]+|Section\s+\d+(?:\.\d+)*|§\s*\d+(?:\.\d+)*|\d{1,2}\.\s+\D)"
+    )
+    return re.sub(rf"(?im)([^\n])\n({heading_start})", r"\1\n\n\2", text)
+
+
+def normalize_inline_article_heading_breaks(text: str) -> str:
+    return re.sub(
+        r"(?i)([.;])\s+(ARTICLE\s+[IVXLC]+\b(?:\s+[A-Z][A-Z ]{1,80})?)",
+        r"\1\n\n## \2",
+        text,
+    )
 
 
 def promote_paragraph_section_headings(text: str) -> str:
@@ -452,42 +527,155 @@ def inject_numbered_item_breaks(text: str) -> str:
     return text
 
 
-def looks_like_flattened_dash_list_line(line: str) -> bool:
+def split_flattened_dash_list_line(line: str) -> List[str] | None:
     stripped = line.strip()
     if not stripped.startswith("- "):
-        return False
+        return None
 
     parts = [part.strip() for part in re.split(r"\s+-\s+", stripped[2:]) if part.strip()]
     if len(parts) < 3:
-        return False
+        return None
 
     for part in parts:
         word_count = count_words(part)
         if word_count == 0 or word_count > 8:
-            return False
+            return None
         if re.search(r"[,;:!?]", part):
-            return False
+            return None
 
-    return True
+    indent = re.match(r"^(\s*)", line).group(1)
+    return [f"{indent}- {part}" for part in parts]
 
 
-def normalize_flattened_dash_list_items(text: str) -> str:
+def parenthetical_letter_index(label: str) -> int:
+    return ord(label.lower()) - ord("a")
+
+
+def split_flattened_parenthetical_letter_list_line(line: str) -> List[str] | None:
+    match = re.match(r"^(?P<indent>\s*)(?:(?P<marker>[-+*])\s+)?(?=\([a-z]\)\s+)", line, re.IGNORECASE)
+    if not match:
+        return None
+
+    body_start = match.end()
+    body = line[body_start:]
+    matches = list(LETTER_LIST_ITEM_RE.finditer(body))
+    if len(matches) < 2:
+        return None
+
+    labels = [item.group(1).lower() for item in matches]
+    label_indexes = [parenthetical_letter_index(label) for label in labels]
+    if label_indexes != sorted(label_indexes) or len(set(label_indexes)) != len(label_indexes):
+        return None
+
+    expected_first = label_indexes[0]
+    if label_indexes != list(range(expected_first, expected_first + len(label_indexes))):
+        return None
+
+    indent = "" if match.group("marker") else match.group("indent")
+    prefix = f"{indent}{match.group('marker') or '-'} "
+    parts = []
+    for index, item in enumerate(matches):
+        start = item.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        part = body[start:end].strip()
+        if part:
+            parts.append(f"{prefix}{part}")
+
+    return parts or None
+
+
+def normalize_flattened_list_items(text: str) -> str:
     """
-    Repair parser-flattened catalog/list rows such as:
+    Repair parser-flattened list rows such as:
       - TERM ONE - TERM TWO - TERM THREE
+      - (a) First item (b) Second item (c) Third item
     into one bullet per item. The guard is intentionally narrow so normal legal
-    prose bullets that happen to contain dashes are left alone.
+    prose that happens to contain list-like tokens is left alone.
     """
+    line_splitters = (
+        split_flattened_dash_list_line,
+        split_flattened_parenthetical_letter_list_line,
+    )
     normalized_lines = []
 
     for line in text.splitlines():
-        if not looks_like_flattened_dash_list_line(line):
+        split_lines = next(
+            (
+                candidate
+                for splitter in line_splitters
+                if (candidate := splitter(line))
+            ),
+            None,
+        )
+        if split_lines:
+            for index, split_line in enumerate(split_lines):
+                if index > 0:
+                    normalized_lines.append("")
+                normalized_lines.append(split_line)
+        else:
+            normalized_lines.append(line)
+
+    return "\n".join(normalized_lines)
+
+
+def dominant_subsection_marker(marker_counts: Dict[str, int]) -> str | None:
+    if not marker_counts:
+        return None
+
+    preferred_order = {"-": 0, "+": 1, "*": 2}
+    return sorted(
+        marker_counts.items(),
+        key=lambda item: (-item[1], preferred_order.get(item[0], 99)),
+    )[0][0]
+
+
+def normalize_missing_subsection_markers(text: str) -> str:
+    """
+    Restore a missing list marker on a subsection line when sibling subsection
+    lines with the same parent label consistently use one.
+    """
+    marker_counts_by_parent: Dict[str, Dict[str, int]] = {}
+
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+
+        match = SUBSECTION_MARKER_LINE_RE.match(line)
+        if not match or not match.group("marker"):
+            continue
+
+        parent = match.group("parent")
+        marker = match.group("marker")
+        marker_counts = marker_counts_by_parent.setdefault(parent, {})
+        marker_counts[marker] = marker_counts.get(marker, 0) + 1
+
+    marker_by_parent = {
+        parent: marker
+        for parent, marker_counts in marker_counts_by_parent.items()
+        if (marker := dominant_subsection_marker(marker_counts))
+    }
+    if not marker_by_parent:
+        return text
+
+    normalized_lines = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
             normalized_lines.append(line)
             continue
 
-        indent = re.match(r"^(\s*)", line).group(1)
-        parts = [part.strip() for part in re.split(r"\s+-\s+", line.strip()[2:]) if part.strip()]
-        normalized_lines.extend(f"{indent}- {part}" for part in parts)
+        match = SUBSECTION_MARKER_LINE_RE.match(line)
+        if not match or match.group("marker"):
+            normalized_lines.append(line)
+            continue
+
+        marker = marker_by_parent.get(match.group("parent"))
+        if not marker:
+            normalized_lines.append(line)
+            continue
+
+        normalized_lines.append(
+            f"{match.group('indent')}{marker} {match.group('label')}{match.group('rest')}"
+        )
 
     return "\n".join(normalized_lines)
 
@@ -517,7 +705,14 @@ def normalize_text(text: str) -> str:
 
     text = strip_parser_artifacts(text)
     text = normalize_markdown_heading_markup(text)
-    text = normalize_flattened_dash_list_items(text)
+    text = normalize_inline_markdown_emphasis(text)
+    text = normalize_quoted_text_spacing(text)
+    text = normalize_missing_punctuation_spacing(text)
+    text = normalize_quoted_section_headings(text)
+    text = normalize_inline_article_heading_breaks(text)
+    text = normalize_heading_paragraph_breaks(text)
+    text = normalize_flattened_list_items(text)
+    text = normalize_missing_subsection_markers(text)
     # Parser experiment disabled: old heading/list break repair.
     # text = inject_heading_breaks(text)
     # text = normalize_section_sign_headings(text)
@@ -675,6 +870,12 @@ def build_document_metadata(
 
 def count_article_section_markers(text: str) -> int:
     return len(ARTICLE_RE.findall(text)) + len(SECTION_XY_RE.findall(text))
+
+
+def should_use_article_section_parser(text: str) -> bool:
+    article_count = len(ARTICLE_RE.findall(text))
+    section_count = len(SECTION_XY_RE.findall(text))
+    return article_count >= 2 and section_count >= 3
 
 
 def count_numeric_section_markers(text: str) -> int:
@@ -942,6 +1143,14 @@ def clean_heading_title(title: str, max_words: int = 14) -> str:
     return " ".join(words[:max_words])
 
 
+def clean_section_heading_title(title: str, max_words: int = 14) -> str:
+    title = " ".join(title.split()).strip()
+    match = re.match(r"(.{1,160}?)[.:]\s+[A-Z]", title)
+    if match:
+        title = match.group(1)
+    return clean_heading_title(title, max_words=max_words)
+
+
 def clean_subunit_title(title: str, max_words: int = 10) -> str:
     title = " ".join(title.split()).strip(" .;,:")
     words = title.split()
@@ -969,6 +1178,44 @@ def split_article_section_units(pages: List[Tuple[int, str]]) -> List[Dict[str, 
 
     pending_article_title = False
 
+    def article_heading(number: str | None, title: str | None) -> str | None:
+        if not number:
+            return None
+        return f"## ARTICLE {number}{f' {title}' if title else ''}".strip()
+
+    def is_article_heading_only_current() -> bool:
+        if current.get("section_number") is not None:
+            return False
+
+        heading = article_heading(current.get("article_number"), current.get("article_title"))
+        if not heading:
+            return False
+
+        content_parts = [part.strip() for part in current["content_parts"] if part.strip()]
+        return content_parts == [heading]
+
+    def flush_current() -> None:
+        nonlocal current
+        if not current["content_parts"]:
+            return
+
+        if not is_article_heading_only_current():
+            units.append({
+                **current,
+                "text": "\n".join(current["content_parts"]).strip(),
+                "page_numbers": sorted(set(current["page_numbers"])),
+            })
+
+        current = {
+            "section_type": "front_matter",
+            "article_number": current_article_number,
+            "article_title": current_article_title,
+            "section_number": None,
+            "section_title": current_article_title or "Article Boundary",
+            "content_parts": [],
+            "page_numbers": [],
+        }
+
     for page_no, page_text in pages:
         for raw_line in page_text.splitlines():
             line = raw_line.strip()
@@ -980,57 +1227,64 @@ def split_article_section_units(pages: List[Tuple[int, str]]) -> List[Dict[str, 
 
             m_article = ARTICLE_RE.match(line)
             if m_article:
-                # close current body section before starting new article context
-                if current["content_parts"] and current["section_type"] == "body":
-                    units.append({
-                        **current,
-                        "text": "\n".join(current["content_parts"]).strip(),
-                        "page_numbers": sorted(set(current["page_numbers"])),
-                    })
-                    current = {
-                        "section_type": "front_matter",
-                        "article_number": None,
-                        "article_title": None,
-                        "section_number": None,
-                        "section_title": "Article Boundary",
-                        "content_parts": [],
-                        "page_numbers": [],
-                    }
+                flush_current()
 
                 current_article_number = m_article.group(1).upper()
-                current_article_title = None
-                pending_article_title = True
+                current_article_title = clean_heading_title(m_article.group(2).strip()) if m_article.group(2) else None
+                pending_article_title = current_article_title is None
+                heading = article_heading(current_article_number, current_article_title)
+                current = {
+                    "section_type": "body",
+                    "article_number": current_article_number,
+                    "article_title": current_article_title,
+                    "section_number": None,
+                    "section_title": current_article_title or f"Article {current_article_number}",
+                    "content_parts": [heading] if heading else [],
+                    "page_numbers": [page_no],
+                }
                 continue
 
             if pending_article_title and line.isupper() and len(line) <= 120:
-                current_article_title = line
+                current_article_title = clean_heading_title(line)
                 pending_article_title = False
-
-                if current["section_number"] is None and current["section_type"] == "front_matter":
-                    current["content_parts"].append(line)
-                    current["page_numbers"].append(page_no)
+                current["article_title"] = current_article_title
+                current["section_title"] = current_article_title
+                current["content_parts"] = [article_heading(current_article_number, current_article_title)]
+                current["page_numbers"].append(page_no)
                 continue
             else:
                 pending_article_title = False
 
+            m_attachment = ATTACHMENT_START_RE.match(line.lstrip("#").strip())
+            if m_attachment:
+                flush_current()
+                title = attachment_title_from_match(m_attachment)
+                current = {
+                    "section_type": "appendix",
+                    "article_number": None,
+                    "article_title": None,
+                    "section_number": None,
+                    "section_title": title,
+                    "attachment_type": m_attachment.group("kind").lower(),
+                    "attachment_label": m_attachment.group("label").upper(),
+                    "content_parts": [promote_semantic_heading_markup(line)],
+                    "page_numbers": [page_no],
+                }
+                continue
+
             m_section = SECTION_XY_RE.match(line)
             if m_section:
-                if current["content_parts"]:
-                    units.append({
-                        **current,
-                        "text": "\n".join(current["content_parts"]).strip(),
-                        "page_numbers": sorted(set(current["page_numbers"])),
-                    })
+                flush_current()
 
                 sec_num = m_section.group(1).strip()
-                sec_title = clean_heading_title(m_section.group(2).strip())
+                sec_title = clean_section_heading_title(m_section.group(2).strip())
 
                 header_parts = []
-                if current_article_number:
-                    header_parts.append(f"ARTICLE {current_article_number}")
-                if current_article_title:
-                    header_parts.append(current_article_title)
-                header_parts.append(f"Section {sec_num} {sec_title}")
+                heading = article_heading(current_article_number, current_article_title)
+                if heading:
+                    header_parts.append(heading)
+                    header_parts.append("")
+                header_parts.append(f"## Section {sec_num} {m_section.group(2).strip()}")
 
                 current = {
                     "section_type": "body",
@@ -1045,12 +1299,7 @@ def split_article_section_units(pages: List[Tuple[int, str]]) -> List[Dict[str, 
                 current["content_parts"].append(line)
                 current["page_numbers"].append(page_no)
 
-    if current["content_parts"]:
-        units.append({
-            **current,
-            "text": "\n".join(current["content_parts"]).strip(),
-            "page_numbers": sorted(set(current["page_numbers"])),
-        })
+    flush_current()
 
     return [u for u in units if u["text"].strip()]
 
@@ -1462,6 +1711,16 @@ def is_numbered_section_heading_text(text: str) -> bool:
     return bool(re.match(r"^#{1,6}\s*\d{1,2}\.\s+\D", first_line))
 
 
+def is_body_section_heading_text(text: str) -> bool:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return bool(
+        is_numbered_section_heading_text(text)
+        or re.match(r"^#{1,6}\s*ARTICLE\s+[IVXLC]+\b", first_line, re.IGNORECASE)
+        or re.match(r"^#{1,6}\s*Section\s+\d+(?:\.\d+)*\b", first_line, re.IGNORECASE)
+        or re.match(r"^#{1,6}\s*§\s*\d+(?:\.\d+)*\b", first_line)
+    )
+
+
 def count_words(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text))
 
@@ -1532,7 +1791,7 @@ def merge_preamble_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str,
     for index, unit in enumerate(semantic_units):
         text = unit.get("text", "").strip()
 
-        if is_numbered_section_heading_text(text):
+        if is_body_section_heading_text(text):
             body_start_index = index
             break
 
@@ -1564,6 +1823,37 @@ def starts_with_numbered_section_heading(text: str) -> bool:
     return is_numbered_section_heading_text(text)
 
 
+def first_numbered_section(text: str) -> str | None:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    match = re.match(r"^#{1,6}\s*(\d{1,2})\.\s+\D", first_line)
+    if match:
+        return match.group(1)
+
+    match = re.match(r"^(\d{1,2})\.\s+\D", first_line)
+    return match.group(1) if match else None
+
+
+def contains_subsection_for_parent(text: str, parent_number: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?m)(?:^|\n)\s*(?:[-+*]\s*)?{re.escape(parent_number)}\.\d+\b",
+            text,
+        )
+    )
+
+
+def looks_like_same_section_continuation(previous_text: str, text: str) -> bool:
+    parent_number = first_numbered_section(previous_text)
+    if not parent_number:
+        return False
+
+    next_section_number = first_numbered_section(text)
+    if next_section_number and next_section_number != parent_number:
+        return False
+
+    return contains_subsection_for_parent(text, parent_number)
+
+
 def merge_section_continuation_units(
     semantic_units: List[Dict[str, Any]],
     max_continuation_words: int = 220,
@@ -1589,6 +1879,7 @@ def merge_section_continuation_units(
             and (
                 count_words(text) <= max_continuation_words
                 or unit.get("contains_list_continuation")
+                or looks_like_same_section_continuation(previous.get("text", ""), text)
             )
         ):
             previous["text"] = f"{previous['text'].rstrip()}\n\n{text}"
@@ -1603,6 +1894,89 @@ def merge_section_continuation_units(
         merged_units.append(unit)
 
     return merged_units
+
+
+def is_short_heading_only_text(text: str, max_words: int = 12) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return False
+
+    line = lines[0].lstrip("#").strip()
+    return bool(line and count_words(line) <= max_words)
+
+
+def looks_like_attachment_preface_heading(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return False
+
+    line = lines[0].lstrip("#").strip()
+    if ATTACHMENT_PREFACE_HEADING_RE.match(lines[0]):
+        return True
+
+    words = re.findall(r"[A-Za-z]+", line)
+    if not words or len(words) > 8:
+        return False
+
+    uppercase_words = sum(1 for word in words if word.isupper() or word.istitle())
+    return uppercase_words == len(words)
+
+
+def merge_attachment_preface_headings(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    pending_headings: List[Dict[str, Any]] = []
+    seen_attachment_heading = False
+
+    def flush_pending() -> None:
+        nonlocal seen_attachment_heading
+        out.extend(pending_headings)
+        pending_headings.clear()
+        seen_attachment_heading = False
+
+    for unit in semantic_units:
+        text = unit.get("text", "").strip()
+
+        if (
+            is_short_heading_only_text(text)
+            and (
+                ATTACHMENT_PREFACE_HEADING_RE.match(text)
+                or (seen_attachment_heading and looks_like_attachment_preface_heading(text))
+            )
+        ):
+            pending_headings.append(unit)
+            if ATTACHMENT_PREFACE_HEADING_RE.match(text):
+                seen_attachment_heading = True
+            continue
+
+        if pending_headings and looks_like_heading_block(text):
+            heading_text = "\n\n".join(
+                pending["text"].strip()
+                for pending in pending_headings
+                if pending.get("text", "").strip()
+            )
+            unit = {
+                **unit,
+                "text": "\n\n".join(part for part in [heading_text, text] if part),
+                "page_numbers": sorted({
+                    page
+                    for pending in pending_headings
+                    for page in pending.get("page_numbers", [])
+                } | set(unit.get("page_numbers", []))),
+            }
+            pending_headings.clear()
+            seen_attachment_heading = False
+            out.append(unit)
+            continue
+
+        if pending_headings:
+            flush_pending()
+
+        out.append(unit)
+
+    if pending_headings:
+        flush_pending()
+
+    return out
 
 
 LIST_CONTINUATION_CATALOG_RE = re.compile(
@@ -1902,6 +2276,58 @@ def merge_related_appendix_units(semantic_units: List[Dict[str, Any]]) -> List[D
     return out
 
 
+def attachment_start_match(unit: Dict[str, Any]) -> re.Match | None:
+    first_line = next(
+        (line.strip().lstrip("#").strip() for line in unit.get("text", "").splitlines() if line.strip()),
+        "",
+    )
+    return ATTACHMENT_START_RE.match(first_line)
+
+
+def attachment_title_from_match(match: re.Match) -> str:
+    kind = match.group("kind").title()
+    label = match.group("label").upper()
+    return f"{kind} {label}"
+
+
+def merge_attachment_units(semantic_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    current: Dict[str, Any] | None = None
+
+    def flush_current() -> None:
+        nonlocal current
+        if current is not None:
+            out.append(current)
+            current = None
+
+    for unit in semantic_units:
+        match = attachment_start_match(unit)
+        if match:
+            flush_current()
+            title = attachment_title_from_match(match)
+            current = {
+                **unit,
+                "section_type": "appendix",
+                "section_title": title,
+                "attachment_type": match.group("kind").lower(),
+                "attachment_label": match.group("label").upper(),
+            }
+            continue
+
+        if current is None:
+            out.append(unit)
+            continue
+
+        current["text"] = f"{current['text'].rstrip()}\n\n{unit.get('text', '').strip()}".strip()
+        current["page_numbers"] = sorted(set([
+            *current.get("page_numbers", []),
+            *unit.get("page_numbers", []),
+        ]))
+
+    flush_current()
+    return out
+
+
 # ---------- Semantic unit builder ----------
 
 def split_appendix_into_blocks(unit: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2037,20 +2463,18 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
 
     semantic_units: List[Dict[str, Any]]
 
-    # Parser experiment disabled: specialized legal-format parsers are bypassed
-    # so the current PyMuPDF4LLM output is chunked by natural paragraphs/tokens.
-    # Re-enable this branch if paragraph chunks lose useful legal structure.
-    #
-    # full_text = "\n\n".join(page for _, page in pages)
-    # article_score = count_article_section_markers(full_text)
+    full_text = "\n\n".join(page for _, page in pages)
+    use_article_section_parser = should_use_article_section_parser(full_text)
+
+    # Parser experiment disabled: most specialized legal-format parsers are
+    # bypassed so current PyMuPDF4LLM output is chunked by natural paragraphs.
+    # Article/Section hierarchy is re-enabled only when clearly present because
+    # sections are subordinate to articles in those contracts.
     # numeric_score = count_numeric_section_markers(full_text)
     # roman_score = count_roman_paragraph_markers(full_text)
-    #
-    # if article_score >= 3:
-    #     top_units = split_article_section_units(pages)
-    #     semantic_units = []
-    #     for unit in top_units:
-    #         semantic_units.extend(split_article_section_into_subunits(unit))
+
+    if use_article_section_parser:
+        semantic_units = split_article_section_units(pages)
     # elif roman_score >= 2:
     #     top_units = split_roman_paragraph_units(pages)
     #     semantic_units = []
@@ -2066,15 +2490,18 @@ def build_semantic_units(markdown_text: str, source_file: str) -> Tuple[List[Dic
     #             semantic_units.extend(split_numeric_section_into_subsections(unit))
     # else:
     #     semantic_units = split_paragraph_fallback_units(pages)
-    semantic_units = split_paragraph_fallback_units(pages)
+    else:
+        semantic_units = split_paragraph_fallback_units(pages)
     semantic_units, front_matter_metadata = compact_front_matter_units(semantic_units)
     semantic_units = merge_preamble_units(semantic_units)
     semantic_units = merge_section_continuation_units(semantic_units)
     semantic_units = split_restricted_keyword_catalog_units(semantic_units)
     semantic_units = merge_section_continuation_units(semantic_units)
+    semantic_units = merge_attachment_preface_headings(semantic_units)
     semantic_units = merge_appendix_units_by_heading(semantic_units)
     semantic_units = split_appendix_units_by_category(semantic_units)
     semantic_units = merge_related_appendix_units(semantic_units)
+    semantic_units = merge_attachment_units(semantic_units)
     semantic_units = annotate_suspected_typos(semantic_units)
 
     for i, unit in enumerate(semantic_units, start=1):
@@ -2188,6 +2615,12 @@ def build_final_documents(
                     "front_matter_text": base_metadata.get("front_matter_text"),
                     "front_matter_pages": base_metadata.get("front_matter_pages"),
                     "section_type": unit.get("section_type"),
+                    "article_number": unit.get("article_number"),
+                    "article_title": unit.get("article_title"),
+                    "section_number": unit.get("section_number"),
+                    "section_title": unit.get("section_title"),
+                    "attachment_type": unit.get("attachment_type"),
+                    "attachment_label": unit.get("attachment_label"),
                     "contains_list_continuation": unit.get("contains_list_continuation"),
                     "continues_section": unit.get("continues_section"),
                     "continuation_label": unit.get("continuation_label"),
@@ -2195,10 +2628,6 @@ def build_final_documents(
                     "text_with_sic_annotations": unit.get("text_with_sic_annotations"),
                     # Parser experiment disabled: these fields are only useful
                     # when specialized legal-section parsers are active.
-                    # "article_number": unit.get("article_number"),
-                    # "article_title": unit.get("article_title"),
-                    # "section_number": unit.get("section_number"),
-                    # "section_title": unit.get("section_title"),
                     # "roman_section_number": unit.get("roman_section_number"),
                     # "roman_section_title": unit.get("roman_section_title"),
                     # "subsection_number": unit.get("subsection_number"),
@@ -2334,8 +2763,8 @@ def load_pdf_alternative_method(
 
 
 if __name__ == "__main__":
-    relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CreditcardscomInc_20070810_S-1_EX-10.33_362297_EX-10.33_Affiliate Agreement.pdf"
-    # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CybergyHoldingsInc_20140520_10-Q_EX-10.27_8605784_EX-10.27_Affiliate Agreement.pdf"
+    # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CreditcardscomInc_20070810_S-1_EX-10.33_362297_EX-10.33_Affiliate Agreement.pdf"
+    relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/CybergyHoldingsInc_20140520_10-Q_EX-10.27_8605784_EX-10.27_Affiliate Agreement.pdf"
     # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/DigitalCinemaDestinationsCorp_20111220_S-1_EX-10.10_7346719_EX-10.10_Affiliate Agreement.pdf"
     # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/SouthernStarEnergyInc_20051202_SB-2A_EX-9_801890_EX-9_Affiliate Agreement.pdf"
     # relative_path = "data/raw/CUAD_v1/full_contract_pdf/Part_I/Affiliate_Agreements/SteelVaultCorp_20081224_10-K_EX-10.16_3074935_EX-10.16_Affiliate Agreement.pdf"
