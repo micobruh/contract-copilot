@@ -1,6 +1,21 @@
 # contract-copilot
 
-Another data source: https://huggingface.co/datasets/isaacus/legal-rag-bench
+## CUAD Dataset
+
+This project uses the official [Contract Understanding Atticus Dataset (CUAD) v1](https://huggingface.co/datasets/theatticusproject/cuad). Download it into the path expected by the indexer:
+
+```bash
+python -m pip install -U huggingface_hub
+hf download theatticusproject/cuad \
+  --repo-type dataset \
+  --include "CUAD_v1/**" \
+  --local-dir data/raw
+```
+
+The corpus will be available at `data/raw/CUAD_v1/full_contract_pdf`. The repository's `/data` directory is gitignored.
+
+Optional alternative benchmark: https://huggingface.co/datasets/isaacus/legal-rag-bench
+
 environment name: torch201
 
 Potential unit type to add: 
