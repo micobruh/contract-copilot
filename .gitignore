@@ -2,4 +2,4 @@
 /artifacts
 /local_models
 *.pyc
-*egg-info
+*.egg-info
