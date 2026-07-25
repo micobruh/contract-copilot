@@ -100,10 +100,10 @@ def store_documents_in_batches(documents, embedding_wrapper, storing_batch_size=
 
 
 def build_qdrant_database(embedding_model_name=config.default_embedding_model_name):
-    corpus_documents = load_corpus()
-    print("Loaded legal corpus chunks, total chunks:", len(corpus_documents))
-
     embedding_wrapper = create_embedding_wrapper(embedding_model_name)
+    # Load after the model so chunk sizes match the tokenizer used for indexing.
+    corpus_documents = load_corpus(tokenizer=embedding_wrapper.model.tokenizer)
+    print("Loaded legal corpus chunks, total chunks:", len(corpus_documents))
 
     successful, failed = store_documents_in_batches(
         documents=corpus_documents,

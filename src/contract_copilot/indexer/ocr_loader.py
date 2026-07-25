@@ -44,10 +44,6 @@ ATTACHMENT_RE = re.compile(
     r"^(?P<kind>(?i:Appendix|Schedule|Exhibit|Annex|Attachment|Addendum))"
     r"\s+(?P<label>[A-Z0-9]+[A-Z0-9.-]*)(?:\s*[-:.]?\s*(?P<title>.*))?$",
 )
-PAREN_RE = re.compile(
-    r"^\((?P<label>[a-z]|\d+|[ivxlcdm]+)\)\s+(?P<title>.+)$",
-    re.IGNORECASE,
-)
 TOC_ROW_RE = re.compile(r"(?:\.{2,}|\s{2,})\s*\d+\s*$")
 INLINE_ARTICLE_RE = re.compile(
     r"^(?P<body>.+?[.!?])\s+(?P<header>\*\*ARTICLE\s+(?:[IVXLCDM]+|\d+)"
@@ -139,24 +135,43 @@ def _get_tokenizer():
     return AutoTokenizer.from_pretrained(EMBED_MODEL_ID)
 
 
-def _encode(text: str) -> list[int]:
-    return _get_tokenizer().encode(text, add_special_tokens=False)
+def _encode(
+    text: str,
+    tokenizer: Any | None = None,
+    *,
+    add_special_tokens: bool = False,
+) -> list[int]:
+    return (tokenizer or _get_tokenizer()).encode(
+        text,
+        add_special_tokens=add_special_tokens,
+    )
 
 
-def count_tokens(text: str) -> int:
+def count_tokens(text: str, tokenizer: Any | None = None) -> int:
     """Count tokens with the same tokenizer used to enforce chunk limits."""
-    return len(_encode(text))
+    # Special tokens consume the embedding model's input budget too.
+    return len(_encode(text, tokenizer, add_special_tokens=True))
 
 
-def _decode(token_ids: list[int]) -> str:
-    return _get_tokenizer().decode(token_ids, skip_special_tokens=True).strip()
+def _decode(token_ids: list[int], tokenizer: Any | None = None) -> str:
+    return (tokenizer or _get_tokenizer()).decode(
+        token_ids,
+        skip_special_tokens=True,
+    ).strip()
 
 
 def _clean_line(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\u00a0", " ")
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?(?:u|mark)>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"[ \t]+", " ", text).strip()
     return re.sub(r"^(\*\*|__)(.+)\1$", r"\2", text).strip()
+
+
+def _is_markdown_separator(text: str) -> bool:
+    cells = [cell.strip() for cell in text.strip().strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
 
 
 def _strip_markup(line: str) -> tuple[str, int]:
@@ -195,6 +210,21 @@ def _is_toc_row(text: str) -> bool:
     )
 
 
+def _is_toc_page(text: str) -> bool:
+    """Return true only for a dedicated table-of-contents page."""
+    if not re.search(r"\bTABLE\s+OF\s+CONTENTS\b", text, re.IGNORECASE):
+        return False
+    rows = 0
+    for line in text.splitlines():
+        cleaned = _clean_line(line).strip("| ")
+        markdown_row = bool(re.search(r"\|\s*\d+\s*\|?\s*$", line))
+        if _is_toc_row(cleaned) or markdown_row:
+            rows += 1
+    # Requiring repeated page-number rows avoids dropping a clause that merely
+    # refers to a table of contents.
+    return rows >= 2
+
+
 def _parse_heading(line: _Line) -> _Heading | None:
     """Parse one line as a supported legal heading, without accepting it yet.
 
@@ -202,16 +232,29 @@ def _parse_heading(line: _Line) -> _Heading | None:
     candidates are validated later against sibling headings, which prevents an
     isolated citation or numbered sentence from becoming a section boundary.
     """
-    text, markdown_depth = _strip_markup(line.text)
+    source = line.text.strip().strip("| ")
+    bullet = re.match(r"^[-+*]\s+(?P<body>(?:\*\*|__).+)$", source)
+    if bullet:
+        candidate, _ = _strip_markup(bullet.group("body"))
+        if re.match(
+            r"^(?:(?:ARTICLE|SECTION)\b|\d{1,2}(?:\.\d+)*\.?\s)",
+            candidate,
+            re.IGNORECASE,
+        ):
+            source = bullet.group("body")
+
+    text, markdown_depth = _strip_markup(source)
     styled_body = ""
-    styled = LEADING_BOLD_RE.match(line.text.strip().strip("| "))
+    styled = LEADING_BOLD_RE.match(source)
     if styled:
         # PyMuPDF4LLM commonly bolds only the legal heading and leaves the
         # clause body on the same line. Preserve that boundary before stripping
         # Markdown, otherwise the complete line looks like an oversized title.
         text, _ = _strip_markup(styled.group("heading"))
         styled_body = (styled.group("body") or "").strip()
-    trusted = line.classified_header or markdown_depth > 0 or styled is not None
+    trusted = line.classified_header or markdown_depth > 0 or (
+        styled is not None and not styled_body
+    )
     if not text or line.toc_page or _is_toc_row(line.text):
         return None
 
@@ -282,9 +325,14 @@ def _parse_heading(line: _Line) -> _Heading | None:
 
     match = NUMBERED_RE.match(text)
     if match:
-        title, remainder = _split_title(match.group("title"), trusted)
+        if styled_body:
+            # Bold styling is a stronger boundary than punctuation inside legal
+            # abbreviations such as “E.U. Major Countries”.
+            title, remainder = match.group("title").strip(" .:"), ""
+        else:
+            title, remainder = _split_title(match.group("title"), trusted)
         remainder = " ".join(part for part in (remainder, styled_body) if part)
-        if title and (trusted or title[:1].isupper()):
+        if title and (trusted or styled is not None or title[:1].isupper()):
             number = match.group("label")
             suffix = "." if "." not in number else ""
             return _Heading(
@@ -323,29 +371,39 @@ def _page_lines(page_chunks: list[dict[str, Any]]) -> list[_Line]:
         metadata = chunk.get("metadata") or {}
         page_number = int(metadata.get("page_number") or index)
         text = unicodedata.normalize("NFKC", chunk.get("text") or "")
-        toc_page = bool(re.search(r"\bTABLE\s+OF\s+CONTENTS\b", text, re.IGNORECASE))
+        if _is_toc_page(text):
+            continue
+        toc_page = False
         header_ranges = [
             tuple(box.get("pos", (0, 0)))
             for box in chunk.get("page_boxes", [])
             if box.get("class") == "section-header"
         ]
 
+        page_lines: list[_Line] = []
         cursor = 0
         for raw_line in text.splitlines(keepends=True):
             start, end = cursor, cursor + len(raw_line)
             cursor = end
             cleaned = _clean_line(raw_line)
-            if cleaned in INTERFACE_CONTROLS:
+            if cleaned in INTERFACE_CONTROLS or _is_markdown_separator(cleaned):
                 continue
             classified = any(start < stop and end > begin for begin, stop in header_ranges)
             inline_article = INLINE_ARTICLE_RE.match(cleaned)
             if inline_article:
                 # Some PDFs glue a bold ARTICLE heading to the previous sentence.
                 # Separate it here so the structural parser sees a real boundary.
-                lines.append(_Line(page_number, inline_article.group("body"), False, toc_page))
-                lines.append(_Line(page_number, inline_article.group("header"), classified, toc_page))
+                page_lines.append(_Line(page_number, inline_article.group("body"), False, toc_page))
+                page_lines.append(_Line(page_number, inline_article.group("header"), classified, toc_page))
             else:
-                lines.append(_Line(page_number, cleaned, classified, toc_page))
+                page_lines.append(_Line(page_number, cleaned, classified, toc_page))
+
+        nonempty = [index for index, line in enumerate(page_lines) if line.text]
+        if len(nonempty) > 1:
+            for boundary in {nonempty[0], nonempty[-1]}:
+                if re.fullmatch(r"\d{1,4}", page_lines[boundary].text):
+                    page_lines[boundary] = replace(page_lines[boundary], text="")
+        lines.extend(page_lines)
 
     return lines
 
@@ -450,7 +508,11 @@ def _validated_headings(lines: tuple[_Line, ...] | list[_Line]) -> list[tuple[in
     return accepted
 
 
-def _path_prefix(path: tuple[str, ...], max_tokens: int | None = None) -> str:
+def _path_prefix(
+    path: tuple[str, ...],
+    max_tokens: int | None = None,
+    tokenizer: Any | None = None,
+) -> str:
     """Render a compact Markdown heading path that fits inside the chunk budget."""
     selected = path
     prefix = ""
@@ -459,12 +521,15 @@ def _path_prefix(path: tuple[str, ...], max_tokens: int | None = None) -> str:
             f"{'#' * min(index + 2, 6)} {heading}"
             for index, heading in enumerate(selected)
         )
-        if max_tokens is None or count_tokens(prefix) < max_tokens:
+        if max_tokens is None or count_tokens(prefix, tokenizer) < max_tokens:
             return prefix
         if len(selected) == 1:
             # Pathological OCR titles can exceed the entire budget. Retain a
             # shortened leaf title so some legal context still reaches embedding.
-            return _decode(_encode(prefix)[: max(1, max_tokens // 2)])
+            return _decode(
+                _encode(prefix, tokenizer)[: max(1, max_tokens // 2)],
+                tokenizer,
+            )
         selected = selected[1:]
     return prefix
 
@@ -474,9 +539,16 @@ def _body_text(lines: tuple[_Line, ...]) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
-def _render(path: tuple[str, ...], body: str, max_tokens: int | None = None) -> str:
+def _render(
+    path: tuple[str, ...],
+    body: str,
+    max_tokens: int | None = None,
+    tokenizer: Any | None = None,
+) -> str:
     return "\n\n".join(
-        part for part in (_path_prefix(path, max_tokens), body.strip()) if part
+        part
+        for part in (_path_prefix(path, max_tokens, tokenizer), body.strip())
+        if part
     ).strip()
 
 
@@ -493,9 +565,7 @@ def _make_block(
         body.insert(1, replace(heading_line, text=heading.remainder, classified_header=False))
     path = (*parent.path, heading.display) if parent else (heading.display,)
     labels = (*parent.labels, heading.label) if parent else (heading.label,)
-    strategy = "nested_clause" if heading.kind == "clause" else (
-        "subsection" if parent else "section"
-    )
+    strategy = "subsection" if parent else "section"
     return _Block(path, labels, tuple(body), heading.depth, heading.kind, strategy)
 
 
@@ -506,20 +576,25 @@ def _attachment_layout_slice(
     next_heading: _Heading | None = None,
 ) -> tuple[_Line, ...]:
     """Keep visual lines belonging to one attachment, beginning after its title."""
+    def key(text: str) -> str:
+        stripped, _ = _strip_markup(_clean_line(text))
+        return re.sub(r"\s+", " ", stripped.replace("|", " ")).strip().casefold()
+
     candidates = [line for line in layout_lines if line.page in pages]
-    heading_text = heading.display.casefold()
+    heading_keys = {key(heading.display), key(heading.label)}
     for index, line in enumerate(candidates):
-        if line.text.casefold() == heading_text or line.text.casefold() == heading.label.casefold():
+        if key(line.text) in heading_keys:
             attachment_lines = candidates[index + 1:]
             if next_heading:
-                next_labels = {
-                    next_heading.display.casefold(),
-                    next_heading.label.casefold(),
-                }
+                next_labels = {key(next_heading.display), key(next_heading.label)}
                 attachment_lines = attachment_lines[:next(
                     (
                         offset for offset, candidate in enumerate(attachment_lines)
-                        if candidate.text.casefold() in next_labels
+                        if any(
+                            key(candidate.text) == label
+                            or key(candidate.text).startswith(f"{label} ")
+                            for label in next_labels
+                        )
                     ),
                     len(attachment_lines),
                 )]
@@ -588,46 +663,6 @@ def _build_primary_sections(page_chunks: list[dict[str, Any]]) -> list[_Block]:
     return sections
 
 
-def _parse_parenthetical_headings(lines: tuple[_Line, ...], depth: int) -> list[tuple[int, _Heading]]:
-    """Infer one consistent `(a)`, `(1)`, or `(i)` sibling family."""
-    raw: list[tuple[int, re.Match[str], bool]] = []
-    for index, line in enumerate(lines):
-        text, markdown_depth = _strip_markup(line.text)
-        match = PAREN_RE.match(text)
-        if match:
-            raw.append((index, match, line.classified_header or markdown_depth > 0))
-    if len(raw) < 2:
-        return []
-
-    labels = [match.group("label").lower() for _, match, _ in raw]
-    # Single-letter Roman numerals overlap with alphabetic clauses. Multi-character
-    # labels establish a Roman sequence; otherwise letters are the safer reading.
-    if all(label.isdigit() for label in labels):
-        family = "number"
-    elif any(len(label) > 1 for label in labels):
-        family = "roman"
-    else:
-        family = "letter"
-
-    out = []
-    for index, match, trusted in raw:
-        label = match.group("label").lower()
-        if family == "number" and not label.isdigit():
-            continue
-        if family == "roman" and not re.fullmatch(r"[ivxlcdm]+", label):
-            continue
-        # Parenthetical clauses usually begin directly with prose. Only keep a
-        # genuinely short caption in the path; otherwise retain all prose as body.
-        title, remainder = _split_title(match.group("title"), trusted=False)
-        out.append(
-            (
-                index,
-                _Heading(f"({label})", title, depth + 1, "clause", remainder, trusted),
-            )
-        )
-    return out if len({heading.label for _, heading in out}) >= 2 else []
-
-
 def _nested_boundaries(block: _Block) -> list[tuple[int, _Heading]]:
     """Return only the next structural level below a block."""
     structural = [
@@ -640,7 +675,7 @@ def _nested_boundaries(block: _Block) -> list[tuple[int, _Heading]]:
         # context and could mix grandchildren from different subsections.
         next_depth = min(heading.depth for _, heading in structural)
         return [(index, heading) for index, heading in structural if heading.depth == next_depth]
-    return _parse_parenthetical_headings(block.body, block.depth)
+    return []
 
 
 def _split_block_structurally(block: _Block) -> list[_Block]:
@@ -668,7 +703,11 @@ def _expanded_list_lines(lines: tuple[_Line, ...]) -> list[tuple[_Line, bool]]:
     expanded = []
     for line in lines:
         text = line.text.replace("<br>", " ").strip("| ")
-        if not text or text == "---":
+        if _is_markdown_separator(text):
+            # PyMuPDF emits Markdown table separators around some visual bullets;
+            # they carry no legal meaning and must never become standalone chunks.
+            continue
+        if not text:
             expanded.append((replace(line, text=text), False))
             continue
         markers = list(re.finditer(r"(?:^[-+*]​?\s+|(?:^|(?<=\s))•\s*)", text))
@@ -710,7 +749,11 @@ def _list_block(block: _Block, lines: list[_Line], context: str | None) -> _Bloc
     )
 
 
-def _split_list_blocks(block: _Block, max_tokens: int) -> list[_Block]:
+def _split_list_blocks(
+    block: _Block,
+    max_tokens: int,
+    tokenizer: Any | None = None,
+) -> list[_Block]:
     """Split list runs while repeating only their exact source lead-in."""
     expanded = [item for item in _expanded_list_lines(block.body) if item[0].text]
     if sum(is_item for _, is_item in expanded) < 2:
@@ -757,7 +800,12 @@ def _split_list_blocks(block: _Block, max_tokens: int) -> list[_Block]:
 
         candidate = [*packed, line]
         candidate_block = _list_block(block, candidate, context)
-        if packed and count_tokens(_render(candidate_block.path, _body_text(candidate_block.body))) > max_tokens:
+        candidate_text = _render(
+            candidate_block.path,
+            _body_text(candidate_block.body),
+            tokenizer=tokenizer,
+        )
+        if packed and count_tokens(candidate_text, tokenizer) > max_tokens:
             flush_packed()
         packed.append(line)
 
@@ -803,6 +851,12 @@ def _split_attachment_entries(block: _Block) -> list[_Block]:
     """Recover appendix rows from visual PDF lines without guessing brands."""
     if block.kind != "attachment" or not block.layout:
         return []
+    sentinels = {
+        "list of restricted trademark terms",
+        "partner restricted trademark terms",
+    }
+    if not any(line.text.strip().casefold() in sentinels for line in block.layout):
+        return []
 
     entries: list[tuple[str, list[_Line]]] = []
     current_label: str | None = None
@@ -818,10 +872,7 @@ def _split_attachment_entries(block: _Block) -> list[_Block]:
     previous: _Line | None = None
     for line in block.layout:
         text = line.text.strip()
-        if text.casefold() in {
-            "list of restricted trademark terms",
-            "partner restricted trademark terms",
-        }:
+        if text.casefold() in sentinels:
             continue
 
         explicit = _attachment_entry_heading(text)
@@ -906,7 +957,20 @@ def _sentence_units(text: str) -> list[tuple[int, int]]:
         boundaries.update((match.start(), match.end()))
     boundaries.update(match.start() for match in LIST_START_RE.finditer(text))
 
+    table_spans = []
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        end = cursor + len(line)
+        if line.strip().startswith("|") and line.strip().endswith("|"):
+            # A Markdown table row is one source unit even when its cells contain
+            # punctuation; splitting inside it corrupts both meaning and markup.
+            table_spans.append((cursor, end))
+            boundaries.update((cursor, end))
+        cursor = end
+
     for match in SENTENCE_END_RE.finditer(text):
+        if any(start < match.end() < end for start, end in table_spans):
+            continue
         before = text[:match.end()].rstrip()
         last_word = before.split()[-1].strip("\"'“”‘’()[]").lower()
         if last_word in ABBREVIATIONS or re.search(r"(?:\b[A-Z]\.){2,}$", before):
@@ -936,30 +1000,35 @@ def _hard_token_windows(
     end_offset: int,
     max_tokens: int,
     overlap_tokens: int,
+    tokenizer: Any | None = None,
 ) -> list[_Leaf]:
     """Use fixed token windows for one unit that cannot otherwise fit."""
-    prefix_tokens = count_tokens(f"{prefix}\n\n")
+    prefix_tokens = count_tokens(f"{prefix}\n\n", tokenizer)
     budget = max_tokens - prefix_tokens
     if budget <= 0:
         raise ValueError("Section heading path exceeds max_tokens")
 
-    tokenizer = _get_tokenizer()
+    tokenizer = tokenizer or _get_tokenizer()
     unit_text = body[start_offset:end_offset]
     encoded = tokenizer(unit_text, add_special_tokens=False, return_offsets_mapping=True)
     token_ids = list(encoded["input_ids"])
     offsets = list(encoded.get("offset_mapping") or [])
+    if len(offsets) != len(token_ids):
+        raise ValueError(
+            "The embedding tokenizer must provide offset mappings for hard token splits"
+        )
     overlap = min(overlap_tokens, max(0, budget - 1))
     leaves: list[_Leaf] = []
     start = 0
     while start < len(token_ids):
         end = min(start + budget, len(token_ids))
-        chunk_body = _decode(token_ids[start:end])
+        # Slice the source rather than decoding token IDs: decode can lowercase
+        # defined terms and insert spaces into citations such as 2001/83/EC.
+        chunk_body = unit_text[offsets[start][0]:offsets[end - 1][1]].strip()
         chunk_text = "\n\n".join(part for part in (prefix, chunk_body) if part)
-        # Decoding and re-encoding can change token counts for some tokenizers.
-        # Tighten the window until the final indexed string satisfies the limit.
-        while count_tokens(chunk_text) > max_tokens and end > start + 1:
+        while count_tokens(chunk_text, tokenizer) > max_tokens and end > start + 1:
             end -= 1
-            chunk_body = _decode(token_ids[start:end])
+            chunk_body = unit_text[offsets[start][0]:offsets[end - 1][1]].strip()
             chunk_text = "\n\n".join(part for part in (prefix, chunk_body) if part)
 
         if offsets and start < len(offsets) and end - 1 < len(offsets):
@@ -976,7 +1045,7 @@ def _hard_token_windows(
                 pages,
                 block.path,
                 block.labels[-1],
-                "token_fallback",
+                "hard_token_window",
                 block.list_context,
             )
         )
@@ -986,9 +1055,14 @@ def _hard_token_windows(
     return leaves
 
 
-def _token_fallback(block: _Block, max_tokens: int, overlap_tokens: int) -> list[_Leaf]:
+def _token_fallback(
+    block: _Block,
+    max_tokens: int,
+    overlap_tokens: int,
+    tokenizer: Any | None = None,
+) -> list[_Leaf]:
     """Pack complete text units, splitting tokens only inside an oversized unit."""
-    prefix = _path_prefix(block.path, max_tokens)
+    prefix = _path_prefix(block.path, max_tokens, tokenizer)
     body = _body_text(block.body)
     units = _sentence_units(body)
     leaves: list[_Leaf] = []
@@ -1001,7 +1075,7 @@ def _token_fallback(block: _Block, max_tokens: int, overlap_tokens: int) -> list
         while chunk_end < len(units):
             candidate = body[units[chunk_start][0]:units[chunk_end][1]].strip()
             candidate_text = "\n\n".join(part for part in (prefix, candidate) if part)
-            if count_tokens(candidate_text) > max_tokens:
+            if count_tokens(candidate_text, tokenizer) > max_tokens:
                 break
             chunk_body = candidate
             chunk_end += 1
@@ -1017,6 +1091,7 @@ def _token_fallback(block: _Block, max_tokens: int, overlap_tokens: int) -> list
                     end_offset,
                     max_tokens,
                     overlap_tokens,
+                    tokenizer,
                 )
             )
             unit_index += 1
@@ -1031,7 +1106,7 @@ def _token_fallback(block: _Block, max_tokens: int, overlap_tokens: int) -> list
                 pages,
                 block.path,
                 block.labels[-1],
-                "token_fallback",
+                "sentence_window",
                 block.list_context,
             )
         )
@@ -1044,7 +1119,7 @@ def _token_fallback(block: _Block, max_tokens: int, overlap_tokens: int) -> list
         while overlap_start > chunk_start:
             candidate_start = overlap_start - 1
             overlap_text = body[units[candidate_start][0]:units[chunk_end - 1][1]]
-            if count_tokens(overlap_text) > overlap_tokens:
+            if count_tokens(overlap_text, tokenizer) > overlap_tokens:
                 break
             overlap_start = candidate_start
         unit_index = overlap_start if overlap_start > chunk_start else chunk_end
@@ -1052,22 +1127,27 @@ def _token_fallback(block: _Block, max_tokens: int, overlap_tokens: int) -> list
     return leaves
 
 
-def _leaf_chunks(block: _Block, max_tokens: int, overlap_tokens: int) -> list[_Leaf]:
+def _leaf_chunks(
+    block: _Block,
+    max_tokens: int,
+    overlap_tokens: int,
+    tokenizer: Any | None = None,
+) -> list[_Leaf]:
     """Recursively descend through structure, then fall back to token windows."""
     # Lists and appendix rows are already complete source units, so preserve
     # them even when their combined parent happens to fit the token budget.
     # Numbered legal children remain size-driven below.
     source_children = _split_attachment_entries(block)
     if not source_children and block.kind != "list" and not _nested_boundaries(block):
-        source_children = _split_list_blocks(block, max_tokens)
+        source_children = _split_list_blocks(block, max_tokens, tokenizer)
     if source_children:
         leaves = []
         for child in source_children:
-            leaves.extend(_leaf_chunks(child, max_tokens, overlap_tokens))
+            leaves.extend(_leaf_chunks(child, max_tokens, overlap_tokens, tokenizer))
         return leaves
 
-    rendered = _render(block.path, _body_text(block.body), max_tokens)
-    if count_tokens(rendered) <= max_tokens:
+    rendered = _render(block.path, _body_text(block.body), max_tokens, tokenizer)
+    if count_tokens(rendered, tokenizer) <= max_tokens:
         pages = tuple(sorted({line.page for line in block.body}))
         return [
             _Leaf(
@@ -1086,9 +1166,9 @@ def _leaf_chunks(block: _Block, max_tokens: int, overlap_tokens: int) -> list[_L
         # the final token fallback where there is no meaningful legal boundary.
         leaves = []
         for child in children:
-            leaves.extend(_leaf_chunks(child, max_tokens, overlap_tokens))
+            leaves.extend(_leaf_chunks(child, max_tokens, overlap_tokens, tokenizer))
         return leaves
-    return _token_fallback(block, max_tokens, overlap_tokens)
+    return _token_fallback(block, max_tokens, overlap_tokens, tokenizer)
 
 
 def _path_metadata(source_file: str) -> dict[str, Any]:
@@ -1163,6 +1243,7 @@ def _build_document_records(
     source_file: str,
     max_tokens: int = 256,
     overlap_tokens: int = 40,
+    tokenizer: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Build indexable leaf records and link them to unsaved parent sections."""
     if max_tokens <= 0:
@@ -1180,9 +1261,13 @@ def _build_document_records(
         # semantic_unit_id represents the complete primary section. Its body is
         # not duplicated in the index; only the leaf records below are persisted.
         semantic_unit_id = f"{stem}|unit|{unit_index}"
-        leaves = _leaf_chunks(section, max_tokens, overlap_tokens)
+        leaves = _leaf_chunks(section, max_tokens, overlap_tokens, tokenizer)
         child_ids = [f"{semantic_unit_id}|chunk|{index}" for index in range(1, len(leaves) + 1)]
-        semantic_text = _render(section.path, _body_text(section.body))
+        semantic_text = _render(
+            section.path,
+            _body_text(section.body),
+            tokenizer=tokenizer,
+        )
 
         for child_index, leaf in enumerate(leaves):
             chunk_id = child_ids[child_index]
@@ -1213,8 +1298,8 @@ def _build_document_records(
                 "page_numbers": pages,
                 "page_start": pages[0] if pages else None,
                 "page_end": pages[-1] if pages else None,
-                "semantic_unit_token_count": count_tokens(semantic_text),
-                "token_count": count_tokens(leaf.text),
+                "semantic_unit_token_count": count_tokens(semantic_text, tokenizer),
+                "token_count": count_tokens(leaf.text, tokenizer),
                 "child_chunk_index": child_index + 1,
                 "child_chunk_count": len(leaves),
                 "prev_chunk_id": child_ids[child_index - 1] if child_index else None,
@@ -1287,6 +1372,7 @@ def load_pdf(
     max_tokens: int = 256,
     overlap_tokens: int = 40,
     debug: bool = False,
+    tokenizer: Any | None = None,
 ) -> list["Document"]:
     """Extract one project-relative PDF into hierarchy-aware leaf Documents."""
     root_path = Path(__file__).resolve().parents[3]
@@ -1308,7 +1394,13 @@ def load_pdf(
 
     _add_pdf_layout_lines(pdf_path, page_chunks)
     artifacts = _interface_artifacts(page_chunks)
-    records = _build_document_records(page_chunks, relative_path, max_tokens, overlap_tokens)
+    records = _build_document_records(
+        page_chunks,
+        relative_path,
+        max_tokens,
+        overlap_tokens,
+        tokenizer,
+    )
     documents = [Document(**record) for record in records]
     if debug:
         print(f"Built {len({doc.metadata['semantic_unit_id'] for doc in documents})} sections "
@@ -1336,6 +1428,7 @@ def load_corpus(
     overlap_tokens: int = 40,
     max_documents: Optional[int] = None,
     debug: bool = False,
+    tokenizer: Any | None = None,
 ) -> list["Document"]:
     """Load all (or the first ``max_documents``) PDFs from a corpus."""
     pdf_paths = iter_corpus_pdf_paths(corpus_dir)
@@ -1343,7 +1436,15 @@ def load_corpus(
         pdf_paths = pdf_paths[:max_documents]
     documents = []
     for relative_path in pdf_paths:
-        documents.extend(load_pdf(relative_path, max_tokens, overlap_tokens, debug))
+        documents.extend(
+            load_pdf(
+                relative_path,
+                max_tokens,
+                overlap_tokens,
+                debug,
+                tokenizer,
+            )
+        )
     return documents
 
 

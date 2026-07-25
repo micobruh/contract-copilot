@@ -1,9 +1,11 @@
 import importlib.util
 import io
+import json
 import re
 import sys
 import unittest
 import gc
+import unicodedata
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,13 +93,12 @@ class HierarchicalChunkingTests(unittest.TestCase):
         sections = ocr_loader._build_primary_sections(pages)
 
         self.assertEqual([section.path[0] for section in sections], [
-            "Preamble",
             "ARTICLE I Definitions",
             "ARTICLE II Services",
         ])
-        self.assertNotIn("ARTICLE 1 Definitions 1", " ".join(sections[0].path))
+        self.assertFalse(any("TABLE OF CONTENTS" in " ".join(section.path) for section in sections))
 
-    def test_recursive_subsections_and_nested_clauses(self):
+    def test_recursive_subsections_preserve_parenthetical_prose(self):
         words = "one two three four five six seven eight"
         pages = [page(
             "1. Services.\n"
@@ -119,9 +120,11 @@ class HierarchicalChunkingTests(unittest.TestCase):
         strategies = {record["metadata"]["split_strategy"] for record in records}
         paths = [record["metadata"]["section_path"] for record in records]
         self.assertIn("subsection", strategies)
-        self.assertIn("nested_clause", strategies)
+        self.assertNotIn("nested_clause", strategies)
         self.assertTrue(any(path[-1].startswith("1.1") for path in paths))
-        self.assertTrue(any(path[-1].startswith("(a)") for path in paths))
+        rendered = "\n".join(record["page_content"] for record in records)
+        self.assertIn("(a) Availability.", rendered)
+        self.assertIn("(b) Security.", rendered)
         self.assertTrue(all(record["metadata"]["token_count"] <= 22 for record in records))
 
     def test_token_fallback_overlaps_complete_sentences_and_counts_prefix(self):
@@ -141,7 +144,10 @@ class HierarchicalChunkingTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(len(records), 3)
-        self.assertTrue(all(record["metadata"]["split_strategy"] == "token_fallback" for record in records))
+        self.assertTrue(all(
+            record["metadata"]["split_strategy"] == "sentence_window"
+            for record in records
+        ))
         self.assertTrue(all(record["metadata"]["token_count"] <= 12 for record in records))
         first_body = records[0]["page_content"].split("\n\n", 1)[1]
         second_body = records[1]["page_content"].split("\n\n", 1)[1]
@@ -162,7 +168,83 @@ class HierarchicalChunkingTests(unittest.TestCase):
         first_body = records[0]["page_content"].split("\n\n", 1)[1].split()
         second_body = records[1]["page_content"].split("\n\n", 1)[1].split()
         self.assertEqual(first_body[-4:], second_body[:4])
+        self.assertTrue(all(
+            record["metadata"]["split_strategy"] == "hard_token_window"
+            for record in records
+        ))
         self.assertTrue(all(record["metadata"]["token_count"] <= 20 for record in records))
+
+    def test_hard_windows_preserve_source_case_and_punctuation(self):
+        body = (
+            "Country-by-Country review preserves 2001/83/EC and DefinedTerm while "
+            "additional words make this one legal sentence exceed the limit safely."
+        )
+        pages = [page(
+            f"1. Fidelity.\n{body}\n",
+            classified_lines={"1. Fidelity."},
+        )]
+
+        records = ocr_loader._build_document_records(
+            pages,
+            "contracts/Fidelity.pdf",
+            max_tokens=12,
+            overlap_tokens=3,
+        )
+        rendered = "\n".join(record["page_content"] for record in records)
+
+        self.assertIn("Country-by-Country", rendered)
+        self.assertIn("2001/83/EC", rendered)
+        self.assertIn("DefinedTerm", rendered)
+        self.assertTrue(all(
+            record["metadata"]["split_strategy"] == "hard_token_window"
+            for record in records
+        ))
+
+    def test_hard_windows_require_source_offsets(self):
+        class NoOffsetTokenizer(FakeTokenizer):
+            def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+                result = super().__call__(
+                    text,
+                    add_special_tokens=add_special_tokens,
+                    return_offsets_mapping=return_offsets_mapping,
+                )
+                result.pop("offset_mapping", None)
+                return result
+
+        pages = [page(
+            "1. Fidelity.\nOne two three four five six seven eight nine ten.\n",
+            classified_lines={"1. Fidelity."},
+        )]
+
+        with self.assertRaisesRegex(ValueError, "offset mappings"):
+            ocr_loader._build_document_records(
+                pages,
+                "contracts/NoOffsets.pdf",
+                max_tokens=7,
+                overlap_tokens=2,
+                tokenizer=NoOffsetTokenizer(),
+            )
+
+    def test_explicit_tokenizer_is_used_for_every_chunk_limit(self):
+        pages = [page(
+            "1. Scope.\nAlpha beta gamma. Delta epsilon zeta.\n",
+            classified_lines={"1. Scope."},
+        )]
+
+        with patch.object(
+            ocr_loader,
+            "_get_tokenizer",
+            side_effect=AssertionError("default tokenizer should not be loaded"),
+        ):
+            records = ocr_loader._build_document_records(
+                pages,
+                "contracts/ExplicitTokenizer.pdf",
+                max_tokens=8,
+                overlap_tokens=2,
+                tokenizer=FakeTokenizer(),
+            )
+
+        self.assertTrue(records)
 
     def test_recovers_glued_number_bare_appendix_and_bold_subsections(self):
         pages = [page(
@@ -188,18 +270,24 @@ class HierarchicalChunkingTests(unittest.TestCase):
         ])
         self.assertIn("means the first defined term", ocr_loader._body_text(children[1].body))
 
-    def test_long_parenthetical_clause_stays_in_body(self):
+    def test_parenthetical_clauses_stay_flat(self):
         clause = " ".join(f"word{index}" for index in range(25)) + "."
         pages = [page(
             f"1. Obligations.\n(a) {clause}\n(b) {clause}\n",
             classified_lines={"1. Obligations."},
         )]
 
-        section = ocr_loader._build_primary_sections(pages)[0]
-        children = ocr_loader._split_block_structurally(section)
+        records = ocr_loader._build_document_records(
+            pages, "contracts/Parentheticals.pdf", max_tokens=20, overlap_tokens=4
+        )
+        rendered = "\n".join(record["page_content"] for record in records)
 
-        self.assertEqual([child.path[-1] for child in children], ["(a)", "(b)"])
-        self.assertIn("word24.", ocr_loader._body_text(children[0].body))
+        self.assertFalse(any(
+            record["metadata"]["split_strategy"] == "nested_clause"
+            for record in records
+        ))
+        self.assertIn("(a)", rendered)
+        self.assertIn("(b)", rendered)
 
     def test_debug_output_groups_chunks_under_sections(self):
         metadata = {
@@ -352,6 +440,154 @@ class HierarchicalChunkingTests(unittest.TestCase):
         sony = next(record for record in records if record["metadata"]["section_path"][-1] == "Sony")
         self.assertIn("My Sony and Vaio", sony["page_content"])
 
+    def test_ordinary_exhibit_does_not_use_attachment_row_parser(self):
+        layout = [
+            {"text": "Exhibit 10.4", "bbox": (50, 50, 130, 60), "page_width": 600},
+            {"text": "Agreement preamble.", "bbox": (50, 70, 200, 80), "page_width": 600},
+            {"text": "1. Definitions", "bbox": (50, 90, 150, 100), "page_width": 600},
+            {"text": "Definition body.", "bbox": (50, 110, 170, 120), "page_width": 600},
+        ]
+        pages = [page(
+            "# Exhibit 10.4\nAgreement preamble.\n# 1. Definitions\nDefinition body.\n",
+            layout_lines=layout,
+        )]
+
+        records = ocr_loader._build_document_records(pages, "contracts/Exhibit.pdf")
+        rendered = "\n".join(record["page_content"] for record in records)
+
+        self.assertFalse(any(
+            record["metadata"]["split_strategy"] == "attachment_entry"
+            for record in records
+        ))
+        self.assertEqual(rendered.count("Agreement preamble."), 1)
+        self.assertEqual(rendered.count("Definition body."), 1)
+
+    def test_bulleted_bold_legal_headings_are_primary_sections(self):
+        pages = [page(
+            "# 1. DEFINITIONS\nDefinition body.\n"
+            "- **2. ASSIGNMENT** Assignment body.\n"
+            "- **3. LICENSE** License body.\n"
+            "- **4. PAYMENT** Payment body.\n"
+            "- **5. TERM** Term body.\n"
+            "- **6. GRANT** Grant body.\n"
+        )]
+
+        sections = ocr_loader._build_primary_sections(pages)
+
+        self.assertEqual(
+            [section.labels[0] for section in sections],
+            ["1.", "2.", "3.", "4.", "5.", "6."],
+        )
+        self.assertNotIn("list", {section.kind for section in sections})
+
+    def test_inline_bold_cross_reference_is_not_a_heading(self):
+        pages = [page(
+            "# 1. Definitions\n"
+            "1.33 VerticalNet Content means the content described in\n"
+            "**Section 3.1** **_[VERTICALNET CONTENT]_** .\n"
+            "# 2. Services\nServices body.\n"
+        )]
+
+        records = ocr_loader._build_document_records(pages, "contracts/Citations.pdf")
+
+        self.assertFalse(any(
+            path[-1].startswith("Section 3.1")
+            for record in records
+            for path in [record["metadata"]["section_path"]]
+        ))
+        definition = next(
+            record for record in records
+            if record["metadata"]["section_path"][0].startswith("1.")
+        )
+        self.assertIn("Section 3.1", definition["page_content"])
+
+    def test_line_cleaning_removes_presentation_markup_and_boundary_page_numbers(self):
+        pages = [page(
+            "12\n# <u>Terms</u><br><mark>Here</mark>\nBody\n7\nMore body\n34\n"
+        )]
+
+        lines = ocr_loader._page_lines(pages)
+        texts = [line.text for line in lines if line.text]
+
+        self.assertEqual(texts, ["# Terms Here", "Body", "7", "More body"])
+
+    def test_bold_heading_keeps_abbreviated_title(self):
+        pages = [page(
+            "# ARTICLE 1 DEFINITIONS\n"
+            "**1.28 “E.U. Major Countries”** means France, Germany, Italy, Spain, "
+            "and the United Kingdom.\n"
+            "**1.29 “FDA”** means the United States Food and Drug Administration "
+            "and any successor authority with the same function.\n"
+        )]
+
+        records = ocr_loader._build_document_records(
+            pages,
+            "contracts/Abbreviations.pdf",
+            max_tokens=24,
+            overlap_tokens=4,
+        )
+        countries = next(
+            record
+            for record in records
+            if record["metadata"]["section_path"][-1].startswith("1.28")
+        )
+
+        self.assertEqual(
+            countries["metadata"]["section_path"][-1],
+            "1.28 “E.U. Major Countries”",
+        )
+        self.assertIn("means France", countries["page_content"])
+
+    def test_markdown_separators_do_not_become_chunks(self):
+        pages = [page(
+            "# 1. Restricted Names\n"
+            "- BRITISH AIRWAYS\n"
+            "|---|\n"
+            "|•CASH PLUS|\n"
+            "|---|\n"
+            "- CHASE FREEDOM\n"
+        )]
+
+        records = ocr_loader._build_document_records(
+            pages,
+            "contracts/Separators.pdf",
+        )
+        rendered = "\n".join(record["page_content"] for record in records)
+
+        self.assertNotIn("\n---", rendered)
+        self.assertIn("BRITISH AIRWAYS", rendered)
+        self.assertIn("CASH PLUS", rendered)
+        self.assertIn("CHASE FREEDOM", rendered)
+
+    def test_markdown_table_rows_are_atomic_sentence_units(self):
+        pages = [page(
+            "# 1. Pricing Notes\n"
+            "|Note 1:|Purchase levels receive annual review.|\n"
+            "|---|---|\n"
+            "|Note 2:|Support staff remain certified.|\n"
+        )]
+
+        records = ocr_loader._build_document_records(
+            pages,
+            "contracts/TableNotes.pdf",
+            max_tokens=11,
+            overlap_tokens=2,
+        )
+        bodies = [record["page_content"] for record in records]
+
+        self.assertTrue(any(
+            "|Note 1:|Purchase levels receive annual review.|" in body
+            for body in bodies
+        ))
+        self.assertTrue(any(
+            "|Note 2:|Support staff remain certified.|" in body
+            for body in bodies
+        ))
+        self.assertFalse(any(
+            record["metadata"]["split_strategy"] == "hard_token_window"
+            for record in records
+        ))
+
     def test_cross_references_resolve_and_continuations_share_paths(self):
         pages = [page(
             "# 1. Definitions\nDefined terms.\n"
@@ -420,7 +656,34 @@ class CuadSmokeTests(unittest.TestCase):
         "CreditcardscomInc_20070810_S-1_EX-10.33_362297_EX-10.33_Affiliate Agreement.pdf",
     ]
 
+    @staticmethod
+    def _normalized(text):
+        text = unicodedata.normalize("NFKC", text).casefold()
+        return " ".join(re.findall(r"\w+", text))
+
     def test_representative_contracts(self):
+        dataset_path = ROOT / "data/raw/CUAD_v1/CUAD_v1.json"
+        if not dataset_path.exists():
+            self.skipTest("CUAD annotations are not available")
+        with dataset_path.open(encoding="utf-8") as dataset_file:
+            dataset = json.load(dataset_file)["data"]
+        selected_titles = {Path(path).stem for path in self.FILES}
+        annotations = {
+            item["title"]: [
+                answer["text"]
+                for paragraph in item["paragraphs"]
+                for question in paragraph["qas"]
+                for answer in question["answers"]
+                if answer["text"]
+            ]
+            for item in dataset
+            if item["title"] in selected_titles
+        }
+        del dataset
+        gc.collect()
+
+        answer_count = 0
+        contained_answer_count = 0
         for relative_path in self.FILES:
             if not (ROOT / relative_path).exists():
                 self.skipTest("CUAD dataset is not available")
@@ -431,6 +694,28 @@ class CuadSmokeTests(unittest.TestCase):
                 self.assertTrue(all(document.metadata["section_path"] for document in documents))
                 self.assertTrue(all(document.metadata["chunk_id"] for document in documents))
                 self.assertTrue(all(document.metadata["page_numbers"] for document in documents))
+                self.assertFalse(any(
+                    "TABLE OF CONTENTS" in document.page_content
+                    for document in documents
+                ))
+                self.assertFalse(any(
+                    document.page_content.rstrip().endswith("\n\n---")
+                    for document in documents
+                ))
+
+                normalized_chunks = [
+                    self._normalized(document.page_content)
+                    for document in documents
+                ]
+                for answer in annotations[Path(relative_path).stem]:
+                    normalized_answer = self._normalized(answer)
+                    if normalized_answer:
+                        answer_count += 1
+                        contained_answer_count += int(any(
+                            normalized_answer in chunk
+                            for chunk in normalized_chunks
+                        ))
+
                 for index, document in enumerate(documents):
                     metadata = document.metadata
                     previous = documents[index - 1] if index else None
@@ -492,10 +777,33 @@ class CuadSmokeTests(unittest.TestCase):
                     }
                     self.assertIsNotNone(references.get("Section 4"))
                     self.assertIsNotNone(references.get("Appendix"))
+                if "AimmuneTherapeuticsInc" in relative_path:
+                    rendered = "\n".join(
+                        document.page_content for document in documents
+                    )
+                    self.assertIn("country-by-country", rendered)
+                    self.assertIn("2001/83/EC", rendered)
+                    self.assertTrue(any(
+                        document.metadata["section_path"][-1]
+                        == "1.28 “E.U. Major Countries”"
+                        for document in documents
+                    ))
+                if "CybergyHoldingsInc" in relative_path:
+                    self.assertTrue(any(
+                        "Note 6" in document.page_content
+                        and "minimums defined by each Purchase Level"
+                        in document.page_content
+                        for document in documents
+                    ))
                 # Avoid retaining one extracted contract while PyMuPDF builds
                 # the next; several representative files are hundreds of pages.
                 del documents
                 gc.collect()
+
+        # This catches extraction/chunking regressions without requiring an
+        # embedding model or conflating retrieval quality with generation.
+        self.assertEqual(answer_count, 175)
+        self.assertGreaterEqual(contained_answer_count, 160)
 
 
 if __name__ == "__main__":

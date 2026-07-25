@@ -37,6 +37,8 @@ class UniversalEmbeddingModel:
                 device=self.device,
                 local_files_only=True,
             )
+            # Chunk limits must use the exact tokenizer that will embed the text.
+            self.tokenizer = self.model.tokenizer
 
         elif self.embedding_model_name == "Qwen/Qwen3-Embedding-4B":
             self.backend = "sentence_transformer"
@@ -47,6 +49,7 @@ class UniversalEmbeddingModel:
                 model_kwargs={"dtype": self.dtype},
                 tokenizer_kwargs={"padding_side": "left"},
             )
+            self.tokenizer = self.model.tokenizer
 
         elif self.embedding_model_name == "jinaai/jina-embeddings-v5-text-small":
             self.backend = "transformers"
